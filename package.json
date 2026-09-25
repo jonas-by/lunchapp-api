@@ -8,7 +8,7 @@
     "test": "echo \"No tests yet...\""
   },
   "dependencies": {
-    "@azure/functions": "^4.0.0"
-  },
-  "devDependencies": {}
+    "@azure/functions": "^4.0.0",
+    "mssql": "^12.7.2"
+  }
 }
