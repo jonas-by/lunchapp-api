@@ -84,7 +84,9 @@ async function getGuestOrders(pool, request, context) {
             go.HostEmployeeNo,
             go.MenuDate,
             go.OrderedMealID AS MealID,
-            go.Quantity,
+            go.Quantity AS OriginalQuantity,
+            COALESCE(oc.CancelledQuantity, 0) AS CancelledQuantity,
+            go.Quantity - COALESCE(oc.CancelledQuantity, 0) AS Quantity,
             go.WorkTask,
             go.OrderTime,
             m.NameEN,
@@ -94,7 +96,15 @@ async function getGuestOrders(pool, request, context) {
         FROM dbo.GuestOrders go
         INNER JOIN dbo.Meals m
             ON m.MealID = go.OrderedMealID
+        OUTER APPLY
+        (
+            SELECT SUM(c.Quantity) AS CancelledQuantity
+            FROM dbo.OrderCancellations c
+            WHERE c.OrderType = N'Guest'
+              AND c.GuestOrderID = go.GuestOrderID
+        ) oc
         WHERE ${filters.join('\n          AND ')}
+          AND go.Quantity - COALESCE(oc.CancelledQuantity, 0) > 0
         ORDER BY
             go.MenuDate,
             CASE m.Category
@@ -120,6 +130,9 @@ async function getGuestOrders(pool, request, context) {
                 menuDate: formatSqlDate(row.MenuDate),
                 mealId: row.MealID,
                 quantity: row.Quantity,
+                originalQuantity: row.OriginalQuantity,
+                cancelledQuantity: Number(row.CancelledQuantity),
+                activeQuantity: row.Quantity,
                 workTask: row.WorkTask,
                 orderTime: row.OrderTime,
                 nameEN: row.NameEN,
@@ -213,42 +226,73 @@ async function putGuestOrders(pool, request, context) {
         await transaction.begin();
         transactionStarted = true;
 
-        await new sql.Request(transaction)
+        const existingResult = await new sql.Request(transaction)
             .input('hostEmployeeNo', sql.Int, payload.hostEmployeeNo)
             .input('dateFrom', sql.Date, payload.dateFrom)
             .input('dateTo', sql.Date, payload.dateTo)
             .query(`
-                DELETE FROM dbo.GuestOrders
-                WHERE HostEmployeeNo = @hostEmployeeNo
-                  AND MenuDate >= @dateFrom
-                  AND MenuDate <= @dateTo;
+                SELECT
+                    go.GuestOrderID,
+                    go.MenuDate,
+                    go.OrderedMealID AS MealID,
+                    COALESCE(SUM(c.Quantity), 0) AS CancelledQuantity
+                FROM dbo.GuestOrders go
+                LEFT JOIN dbo.OrderCancellations c
+                    ON c.OrderType = N'Guest'
+                   AND c.GuestOrderID = go.GuestOrderID
+                WHERE go.HostEmployeeNo = @hostEmployeeNo
+                  AND go.MenuDate >= @dateFrom
+                  AND go.MenuDate <= @dateTo
+                GROUP BY go.GuestOrderID, go.MenuDate, go.OrderedMealID;
             `);
 
+        const desiredKeys = new Set(
+            payload.orders.map(order => `${order.menuDate}|${order.mealId}`)
+        );
+
+        for (const existing of existingResult.recordset) {
+            const menuDate = formatSqlDate(existing.MenuDate);
+            const key = `${menuDate}|${existing.MealID}`;
+            if (!desiredKeys.has(key) && Number(existing.CancelledQuantity) === 0) {
+                await new sql.Request(transaction)
+                    .input('guestOrderId', sql.Int, existing.GuestOrderID)
+                    .query('DELETE FROM dbo.GuestOrders WHERE GuestOrderID = @guestOrderId;');
+            }
+        }
+
         for (const order of payload.orders) {
-            await new sql.Request(transaction)
-                .input('hostEmployeeNo', sql.Int, payload.hostEmployeeNo)
-                .input('menuDate', sql.Date, order.menuDate)
-                .input('mealId', sql.Int, order.mealId)
-                .input('quantity', sql.Int, order.quantity)
-                .input('workTask', sql.NVarChar(200), order.workTask)
-                .query(`
-                    INSERT INTO dbo.GuestOrders
-                    (
-                        HostEmployeeNo,
-                        MenuDate,
-                        OrderedMealID,
-                        Quantity,
-                        WorkTask
-                    )
-                    VALUES
-                    (
-                        @hostEmployeeNo,
-                        @menuDate,
-                        @mealId,
-                        @quantity,
-                        @workTask
-                    );
-                `);
+            const existing = existingResult.recordset.find(row =>
+                formatSqlDate(row.MenuDate) === order.menuDate &&
+                Number(row.MealID) === order.mealId
+            );
+
+            if (existing) {
+                await new sql.Request(transaction)
+                    .input('guestOrderId', sql.Int, existing.GuestOrderID)
+                    .input('quantity', sql.Int,
+                        order.quantity + Number(existing.CancelledQuantity))
+                    .input('workTask', sql.NVarChar(200), order.workTask)
+                    .query(`
+                        UPDATE dbo.GuestOrders
+                        SET Quantity = @quantity,
+                            WorkTask = @workTask,
+                            OrderTime = SYSUTCDATETIME()
+                        WHERE GuestOrderID = @guestOrderId;
+                    `);
+            } else {
+                await new sql.Request(transaction)
+                    .input('hostEmployeeNo', sql.Int, payload.hostEmployeeNo)
+                    .input('menuDate', sql.Date, order.menuDate)
+                    .input('mealId', sql.Int, order.mealId)
+                    .input('quantity', sql.Int, order.quantity)
+                    .input('workTask', sql.NVarChar(200), order.workTask)
+                    .query(`
+                        INSERT INTO dbo.GuestOrders
+                            (HostEmployeeNo, MenuDate, OrderedMealID, Quantity, WorkTask)
+                        VALUES
+                            (@hostEmployeeNo, @menuDate, @mealId, @quantity, @workTask);
+                    `);
+            }
         }
 
         await transaction.commit();

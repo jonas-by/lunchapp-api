@@ -84,7 +84,9 @@ async function getOrders(pool, request, context) {
             o.EmployeeNo,
             o.MenuDate,
             o.OrderedMealID AS MealID,
-            o.Quantity,
+            o.Quantity AS OriginalQuantity,
+            COALESCE(oc.CancelledQuantity, 0) AS CancelledQuantity,
+            o.Quantity - COALESCE(oc.CancelledQuantity, 0) AS Quantity,
             o.OrderTime,
             m.NameEN,
             m.NameSV,
@@ -93,7 +95,15 @@ async function getOrders(pool, request, context) {
         FROM dbo.Orders o
         INNER JOIN dbo.Meals m
             ON m.MealID = o.OrderedMealID
+        OUTER APPLY
+        (
+            SELECT SUM(c.Quantity) AS CancelledQuantity
+            FROM dbo.OrderCancellations c
+            WHERE c.OrderType = N'Employee'
+              AND c.OrderID = o.OrderID
+        ) oc
         WHERE ${filters.join('\n          AND ')}
+          AND o.Quantity - COALESCE(oc.CancelledQuantity, 0) > 0
         ORDER BY
             o.MenuDate,
             CASE m.Category
@@ -119,6 +129,9 @@ async function getOrders(pool, request, context) {
                 menuDate: formatSqlDate(row.MenuDate),
                 mealId: row.MealID,
                 quantity: row.Quantity,
+                originalQuantity: row.OriginalQuantity,
+                cancelledQuantity: Number(row.CancelledQuantity),
+                activeQuantity: row.Quantity,
                 orderTime: row.OrderTime,
                 nameEN: row.NameEN,
                 nameSV: row.NameSV,
@@ -211,39 +224,70 @@ async function putOrders(pool, request, context) {
         await transaction.begin();
         transactionStarted = true;
 
-        await new sql.Request(transaction)
+        const existingResult = await new sql.Request(transaction)
             .input('employeeNo', sql.Int, payload.employeeNo)
             .input('dateFrom', sql.Date, payload.dateFrom)
             .input('dateTo', sql.Date, payload.dateTo)
             .query(`
-                DELETE FROM dbo.Orders
-                WHERE EmployeeNo = @employeeNo
-                  AND MenuDate >= @dateFrom
-                  AND MenuDate <= @dateTo;
+                SELECT
+                    o.OrderID,
+                    o.MenuDate,
+                    o.OrderedMealID AS MealID,
+                    COALESCE(SUM(c.Quantity), 0) AS CancelledQuantity
+                FROM dbo.Orders o
+                LEFT JOIN dbo.OrderCancellations c
+                    ON c.OrderType = N'Employee'
+                   AND c.OrderID = o.OrderID
+                WHERE o.EmployeeNo = @employeeNo
+                  AND o.MenuDate >= @dateFrom
+                  AND o.MenuDate <= @dateTo
+                GROUP BY o.OrderID, o.MenuDate, o.OrderedMealID;
             `);
 
+        const desiredKeys = new Set(
+            payload.orders.map(order => `${order.menuDate}|${order.mealId}`)
+        );
+
+        for (const existing of existingResult.recordset) {
+            const menuDate = formatSqlDate(existing.MenuDate);
+            const key = `${menuDate}|${existing.MealID}`;
+            if (!desiredKeys.has(key) && Number(existing.CancelledQuantity) === 0) {
+                await new sql.Request(transaction)
+                    .input('orderId', sql.Int, existing.OrderID)
+                    .query('DELETE FROM dbo.Orders WHERE OrderID = @orderId;');
+            }
+        }
+
         for (const order of payload.orders) {
-            await new sql.Request(transaction)
-                .input('employeeNo', sql.Int, payload.employeeNo)
-                .input('menuDate', sql.Date, order.menuDate)
-                .input('mealId', sql.Int, order.mealId)
-                .input('quantity', sql.Int, order.quantity)
-                .query(`
-                    INSERT INTO dbo.Orders
-                    (
-                        EmployeeNo,
-                        MenuDate,
-                        OrderedMealID,
-                        Quantity
-                    )
-                    VALUES
-                    (
-                        @employeeNo,
-                        @menuDate,
-                        @mealId,
-                        @quantity
-                    );
-                `);
+            const existing = existingResult.recordset.find(row =>
+                formatSqlDate(row.MenuDate) === order.menuDate &&
+                Number(row.MealID) === order.mealId
+            );
+
+            if (existing) {
+                await new sql.Request(transaction)
+                    .input('orderId', sql.Int, existing.OrderID)
+                    .input('quantity', sql.Int,
+                        order.quantity + Number(existing.CancelledQuantity))
+                    .query(`
+                        UPDATE dbo.Orders
+                        SET Quantity = @quantity,
+                            OrderTime = SYSUTCDATETIME()
+                        WHERE OrderID = @orderId;
+                    `);
+            } else {
+                await new sql.Request(transaction)
+                    .input('employeeNo', sql.Int, payload.employeeNo)
+                    .input('menuDate', sql.Date, order.menuDate)
+                    .input('mealId', sql.Int, order.mealId)
+                    .input('quantity', sql.Int, order.quantity)
+                    .query(`
+                        INSERT INTO dbo.Orders
+                            (EmployeeNo, MenuDate, OrderedMealID, Quantity)
+                        VALUES
+                            (@employeeNo, @menuDate, @mealId, @quantity);
+                    `);
+            }
         }
 
         await transaction.commit();
