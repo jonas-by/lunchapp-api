@@ -284,6 +284,27 @@ async function updateCycle(pool, cycleId, request, context) {
         return conflictResponse(cycle.startDate, conflict);
     }
 
+    if (cycle.status === 'Published' && existing.Status !== 'Published') {
+        const publishValidation = await validateCycleForPublishing(
+            pool,
+            cycleId,
+            existing.NumberOfWeeks
+        );
+
+        if (!publishValidation.valid) {
+            return {
+                status: 409,
+                jsonBody: {
+                    error: 'Menu cycle cannot be published',
+                    configuredWeeks: publishValidation.configuredWeeks,
+                    expectedWeeks: existing.NumberOfWeeks,
+                    incompleteDays: publishValidation.incompleteDays,
+                    archivedMeals: publishValidation.archivedMeals
+                }
+            };
+        }
+    }
+
     const result = await pool.request()
         .input('cycleId', sql.Int, cycleId)
         .input('name', sql.NVarChar(100), cycle.name)
@@ -312,6 +333,99 @@ async function updateCycle(pool, cycleId, request, context) {
     return {
         status: 200,
         jsonBody: mapCycle(result.recordset[0])
+    };
+}
+
+async function validateCycleForPublishing(pool, cycleId, expectedWeeks) {
+    const result = await pool.request()
+        .input('cycleId', sql.Int, cycleId)
+        .query(`
+            SELECT
+                mw.WeekNumber,
+                md.DayNumber,
+                m.MealID,
+                m.NameEN,
+                m.NameSV,
+                m.NameFI,
+                m.Active
+            FROM dbo.MenuWeeks mw
+            LEFT JOIN dbo.MenuDays md
+                ON md.MenuWeekID = mw.MenuWeekID
+            LEFT JOIN dbo.DayMeals dm
+                ON dm.MenuDayID = md.MenuDayID
+            LEFT JOIN dbo.Meals m
+                ON m.MealID = dm.MealID
+            WHERE mw.MenuCycleID = @cycleId
+            ORDER BY
+                mw.WeekNumber,
+                md.DayNumber,
+                m.MealID;
+        `);
+
+    const configuredWeeks = new Set(
+        result.recordset.map(row => Number(row.WeekNumber))
+    );
+    const incompleteDays = [];
+    const archivedMeals = [];
+
+    for (let weekNumber = 1; weekNumber <= expectedWeeks; weekNumber += 1) {
+        if (!configuredWeeks.has(weekNumber)) {
+            for (let dayNumber = 1; dayNumber <= 5; dayNumber += 1) {
+                incompleteDays.push({
+                    weekNumber,
+                    dayNumber,
+                    reason: 'Menu week does not exist'
+                });
+            }
+            continue;
+        }
+
+        for (let dayNumber = 1; dayNumber <= 5; dayNumber += 1) {
+            const rows = result.recordset.filter(row =>
+                Number(row.WeekNumber) === weekNumber &&
+                Number(row.DayNumber) === dayNumber
+            );
+
+            if (rows.length === 0) {
+                incompleteDays.push({
+                    weekNumber,
+                    dayNumber,
+                    reason: 'Menu day does not exist'
+                });
+                continue;
+            }
+
+            const assignedMeals = rows.filter(row => row.MealID !== null);
+            if (assignedMeals.length === 0) {
+                incompleteDays.push({
+                    weekNumber,
+                    dayNumber,
+                    reason: 'No meals assigned'
+                });
+                continue;
+            }
+
+            for (const row of assignedMeals) {
+                if (!Boolean(row.Active)) {
+                    archivedMeals.push({
+                        weekNumber,
+                        dayNumber,
+                        mealId: row.MealID,
+                        mealName: row.NameEN || row.NameSV || row.NameFI || `Meal ${row.MealID}`
+                    });
+                }
+            }
+        }
+    }
+
+    return {
+        valid:
+            configuredWeeks.size === expectedWeeks &&
+            incompleteDays.length === 0 &&
+            archivedMeals.length === 0,
+        configuredWeeks: configuredWeeks.size,
+        incompleteDays,
+        archivedMeals
     };
 }
 
