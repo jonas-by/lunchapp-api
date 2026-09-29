@@ -311,12 +311,17 @@ async function deleteMeal(pool, mealId, request, context) {
         const referenceResult = await new sql.Request(transaction)
             .input('mealId', sql.Int, mealId)
             .query(`
-                SELECT COUNT(*) AS ReferenceCount
-                FROM dbo.DayMeals
-                WHERE MealID = @mealId;
+                SELECT
+                    (SELECT COUNT(*) FROM dbo.DayMeals WHERE MealID = @mealId) AS MenuReferences,
+                    (SELECT COUNT(*) FROM dbo.Orders WHERE MealID = @mealId) AS OrderReferences,
+                    (SELECT COUNT(*) FROM dbo.GuestOrders WHERE MealID = @mealId) AS GuestOrderReferences;
             `);
 
-        const referenceCount = referenceResult.recordset[0].ReferenceCount;
+        const references = referenceResult.recordset[0];
+        const referenceCount =
+            Number(references.MenuReferences) +
+            Number(references.OrderReferences) +
+            Number(references.GuestOrderReferences);
 
         if (referenceCount > 0) {
             await transaction.rollback();
@@ -325,10 +330,15 @@ async function deleteMeal(pool, mealId, request, context) {
             return {
                 status: 409,
                 jsonBody: {
-                    error: 'Meal cannot be permanently deleted because it is used in a menu',
+                    error: 'Meal cannot be permanently deleted because it is used in menus or orders',
                     mealId,
                     referenceCount,
-                    suggestion: 'Use DELETE without ?hard=true to soft-delete it instead'
+                    references: {
+                        menus: Number(references.MenuReferences),
+                        orders: Number(references.OrderReferences),
+                        guestOrders: Number(references.GuestOrderReferences)
+                    },
+                    suggestion: 'Archive the meal instead'
                 }
             };
         }
