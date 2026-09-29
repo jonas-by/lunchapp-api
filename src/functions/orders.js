@@ -80,27 +80,20 @@ async function getOrders(pool, request, context) {
 
     const result = await dbRequest.query(`
         SELECT
+            o.OrderID,
             o.EmployeeNo,
             o.MenuDate,
             o.OrderedMealID AS MealID,
-            m.NameEN,
-            m.NameSV,
-            m.NameFI,
-            m.Category,
-            COUNT(*) AS Quantity,
-            MAX(o.OrderTime) AS LastOrderTime
-        FROM dbo.Orders o
-        INNER JOIN dbo.Meals m
-            ON m.MealID = o.OrderedMealID
-        WHERE ${filters.join('\n          AND ')}
-        GROUP BY
-            o.EmployeeNo,
-            o.MenuDate,
-            o.OrderedMealID,
+            o.Quantity,
+            o.OrderTime,
             m.NameEN,
             m.NameSV,
             m.NameFI,
             m.Category
+        FROM dbo.Orders o
+        INNER JOIN dbo.Meals m
+            ON m.MealID = o.OrderedMealID
+        WHERE ${filters.join('\n          AND ')}
         ORDER BY
             o.MenuDate,
             CASE m.Category
@@ -121,15 +114,16 @@ async function getOrders(pool, request, context) {
             dateFrom,
             dateTo,
             orders: result.recordset.map(row => ({
+                orderId: row.OrderID,
                 employeeNo: row.EmployeeNo,
                 menuDate: formatSqlDate(row.MenuDate),
                 mealId: row.MealID,
                 quantity: row.Quantity,
+                orderTime: row.OrderTime,
                 nameEN: row.NameEN,
                 nameSV: row.NameSV,
                 nameFI: row.NameFI,
-                category: row.Category,
-                lastOrderTime: row.LastOrderTime
+                category: row.Category
             }))
         }
     };
@@ -150,10 +144,24 @@ async function putOrders(pool, request, context) {
 
     const payload = validation.payload;
 
-    context.log(
-        `Replacing orders for employee ${payload.employeeNo} between ` +
-        `${payload.dateFrom} and ${payload.dateTo}`
-    );
+    const employeeResult = await pool.request()
+        .input('employeeNo', sql.Int, payload.employeeNo)
+        .query(`
+            SELECT EmployeeNo
+            FROM dbo.Employees
+            WHERE EmployeeNo = @employeeNo
+              AND COALESCE(Active, 1) = 1;
+        `);
+
+    if (employeeResult.recordset.length === 0) {
+        return {
+            status: 400,
+            jsonBody: {
+                error: 'Employee does not exist or is inactive',
+                employeeNo: payload.employeeNo
+            }
+        };
+    }
 
     const distinctMealIds = [
         ...new Set(payload.orders.map(order => order.mealId))
@@ -191,6 +199,11 @@ async function putOrders(pool, request, context) {
         }
     }
 
+    context.log(
+        `Replacing orders for employee ${payload.employeeNo} between ` +
+        `${payload.dateFrom} and ${payload.dateTo}`
+    );
+
     const transaction = new sql.Transaction(pool);
     let transactionStarted = false;
 
@@ -209,31 +222,28 @@ async function putOrders(pool, request, context) {
                   AND MenuDate <= @dateTo;
             `);
 
-        let insertedRows = 0;
-
         for (const order of payload.orders) {
-            for (let copy = 0; copy < order.quantity; copy += 1) {
-                await new sql.Request(transaction)
-                    .input('employeeNo', sql.Int, payload.employeeNo)
-                    .input('menuDate', sql.Date, order.menuDate)
-                    .input('mealId', sql.Int, order.mealId)
-                    .query(`
-                        INSERT INTO dbo.Orders
-                        (
-                            EmployeeNo,
-                            MenuDate,
-                            OrderedMealID
-                        )
-                        VALUES
-                        (
-                            @employeeNo,
-                            @menuDate,
-                            @mealId
-                        );
-                    `);
-
-                insertedRows += 1;
-            }
+            await new sql.Request(transaction)
+                .input('employeeNo', sql.Int, payload.employeeNo)
+                .input('menuDate', sql.Date, order.menuDate)
+                .input('mealId', sql.Int, order.mealId)
+                .input('quantity', sql.Int, order.quantity)
+                .query(`
+                    INSERT INTO dbo.Orders
+                    (
+                        EmployeeNo,
+                        MenuDate,
+                        OrderedMealID,
+                        Quantity
+                    )
+                    VALUES
+                    (
+                        @employeeNo,
+                        @menuDate,
+                        @mealId,
+                        @quantity
+                    );
+                `);
         }
 
         await transaction.commit();
@@ -247,7 +257,10 @@ async function putOrders(pool, request, context) {
                 dateFrom: payload.dateFrom,
                 dateTo: payload.dateTo,
                 orderLines: payload.orders.length,
-                insertedRows
+                totalLunches: payload.orders.reduce(
+                    (sum, order) => sum + order.quantity,
+                    0
+                )
             }
         };
     } catch (error) {
@@ -255,7 +268,10 @@ async function putOrders(pool, request, context) {
             try {
                 await transaction.rollback();
             } catch (rollbackError) {
-                context.error('Order transaction rollback failed', rollbackError);
+                context.error(
+                    'Order transaction rollback failed',
+                    rollbackError
+                );
             }
         }
 
@@ -277,7 +293,9 @@ function validatePutPayload(body) {
     }
 
     if (!dateFrom || !dateTo) {
-        return { error: 'dateFrom and dateTo must use YYYY-MM-DD format' };
+        return {
+            error: 'dateFrom and dateTo must use YYYY-MM-DD format'
+        };
     }
 
     if (dateFrom > dateTo) {
@@ -300,7 +318,9 @@ function validatePutPayload(body) {
         const quantity = parsePositiveInteger(order.quantity);
 
         if (!menuDate) {
-            return { error: 'Every menuDate must use YYYY-MM-DD format' };
+            return {
+                error: 'Every menuDate must use YYYY-MM-DD format'
+            };
         }
 
         if (menuDate < dateFrom || menuDate > dateTo) {
@@ -320,10 +340,12 @@ function validatePutPayload(body) {
         }
 
         const key = `${menuDate}:${mealId}`;
+        const existing = uniqueOrders.get(key);
+
         uniqueOrders.set(key, {
             menuDate,
             mealId,
-            quantity: (uniqueOrders.get(key)?.quantity || 0) + quantity
+            quantity: (existing?.quantity || 0) + quantity
         });
     }
 
