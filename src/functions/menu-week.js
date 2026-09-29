@@ -4,43 +4,37 @@ const sql = require('mssql');
 app.http('menu-week', {
     methods: ['GET', 'PUT'],
     authLevel: 'anonymous',
-    route: 'menu/week/{weekNumber}',
-
+    route: 'menu/cycles/{cycleId}/weeks/{weekNumber}',
     handler: async (request, context) => {
+        const cycleId = Number.parseInt(request.params.cycleId, 10);
         const weekNumber = Number.parseInt(request.params.weekNumber, 10);
 
+        if (!Number.isInteger(cycleId) || cycleId <= 0) {
+            return badRequest('Cycle ID must be a positive integer');
+        }
+
         if (!Number.isInteger(weekNumber) || weekNumber < 1 || weekNumber > 8) {
-            return {
-                status: 400,
-                jsonBody: {
-                    error: 'Week number must be an integer between 1 and 8'
-                }
-            };
+            return badRequest('Week number must be an integer between 1 and 8');
         }
 
         try {
             const pool = await sql.connect(process.env.SqlConnectionString);
 
             if (request.method === 'GET') {
-                return await getMenuWeek(pool, weekNumber, context);
+                return await getMenuWeek(pool, cycleId, weekNumber, context);
             }
 
             if (request.method === 'PUT') {
-                return await putMenuWeek(pool, weekNumber, request, context);
+                return await putMenuWeek(pool, cycleId, weekNumber, request, context);
             }
 
             return {
                 status: 405,
-                headers: {
-                    Allow: 'GET, PUT'
-                },
-                jsonBody: {
-                    error: 'Method not allowed'
-                }
+                headers: { Allow: 'GET, PUT' },
+                jsonBody: { error: 'Method not allowed' }
             };
         } catch (error) {
             context.error('Menu week request failed', error);
-
             return {
                 status: 500,
                 jsonBody: {
@@ -52,28 +46,39 @@ app.http('menu-week', {
     }
 });
 
-async function getMenuWeek(pool, weekNumber, context) {
-    context.log(`Loading rotation week ${weekNumber}`);
+async function getMenuWeek(pool, cycleId, weekNumber, context) {
+    context.log(`Loading cycle ${cycleId}, rotation week ${weekNumber}`);
 
     const result = await pool.request()
+        .input('cycleId', sql.Int, cycleId)
         .input('weekNumber', sql.Int, weekNumber)
         .query(`
             SELECT
+                mc.MenuCycleID,
+                mc.Name AS CycleName,
+                mc.StartDate,
+                mc.NumberOfWeeks,
+                mc.Status,
+                mw.MenuWeekID,
                 mw.WeekNumber,
                 md.DayNumber,
                 m.MealID,
                 m.NameEN,
                 m.NameSV,
                 m.NameFI,
-                m.Category
-            FROM dbo.MenuWeeks mw
+                m.Category,
+                m.Active
+            FROM dbo.MenuCycles mc
+            INNER JOIN dbo.MenuWeeks mw
+                ON mw.MenuCycleID = mc.MenuCycleID
             INNER JOIN dbo.MenuDays md
                 ON md.MenuWeekID = mw.MenuWeekID
             LEFT JOIN dbo.DayMeals dm
                 ON dm.MenuDayID = md.MenuDayID
             LEFT JOIN dbo.Meals m
                 ON m.MealID = dm.MealID
-            WHERE mw.WeekNumber = @weekNumber
+            WHERE mc.MenuCycleID = @cycleId
+              AND mw.WeekNumber = @weekNumber
             ORDER BY
                 md.DayNumber,
                 CASE m.Category
@@ -88,14 +93,10 @@ async function getMenuWeek(pool, weekNumber, context) {
         `);
 
     if (result.recordset.length === 0) {
-        return {
-            status: 404,
-            jsonBody: {
-                error: `Menu week ${weekNumber} does not exist`
-            }
-        };
+        return notFound(`Menu cycle ${cycleId}, week ${weekNumber} does not exist`);
     }
 
+    const firstRow = result.recordset[0];
     const days = [1, 2, 3, 4, 5].map(dayNumber => ({
         dayNumber,
         meals: []
@@ -108,7 +109,8 @@ async function getMenuWeek(pool, weekNumber, context) {
                 nameEN: row.NameEN,
                 nameSV: row.NameSV,
                 nameFI: row.NameFI,
-                category: row.Category
+                category: row.Category,
+                active: Boolean(row.Active)
             });
         }
     }
@@ -116,37 +118,31 @@ async function getMenuWeek(pool, weekNumber, context) {
     return {
         status: 200,
         jsonBody: {
+            menuCycleId: firstRow.MenuCycleID,
+            cycleName: firstRow.CycleName,
+            startDate: formatDate(firstRow.StartDate),
+            numberOfWeeks: firstRow.NumberOfWeeks,
+            status: firstRow.Status,
+            menuWeekId: firstRow.MenuWeekID,
             weekNumber,
             days
         }
     };
 }
 
-async function putMenuWeek(pool, weekNumber, request, context) {
-    context.log(`Saving rotation week ${weekNumber}`);
+async function putMenuWeek(pool, cycleId, weekNumber, request, context) {
+    context.log(`Saving cycle ${cycleId}, rotation week ${weekNumber}`);
 
     let body;
-
     try {
         body = await request.json();
     } catch {
-        return {
-            status: 400,
-            jsonBody: {
-                error: 'Request body must contain valid JSON'
-            }
-        };
+        return badRequest('Request body must contain valid JSON');
     }
 
     const validationError = validatePayload(body);
-
     if (validationError) {
-        return {
-            status: 400,
-            jsonBody: {
-                error: validationError
-            }
-        };
+        return badRequest(validationError);
     }
 
     const days = body.days.map(day => ({
@@ -167,25 +163,36 @@ async function putMenuWeek(pool, weekNumber, request, context) {
         });
 
         const mealCheckResult = await mealCheckRequest.query(`
-            SELECT MealID
+            SELECT MealID, Active
             FROM dbo.Meals
             WHERE MealID IN (${parameterNames.join(', ')});
         `);
 
-        const existingMealIds = new Set(
-            mealCheckResult.recordset.map(row => row.MealID)
+        const existingMeals = new Map(
+            mealCheckResult.recordset.map(row => [row.MealID, Boolean(row.Active)])
         );
 
         const missingMealIds = submittedMealIds.filter(
-            mealId => !existingMealIds.has(mealId)
+            mealId => !existingMeals.has(mealId)
         );
 
         if (missingMealIds.length > 0) {
+            return badRequestWithDetails(
+                'One or more submitted meals do not exist',
+                { missingMealIds }
+            );
+        }
+
+        const inactiveMealIds = submittedMealIds.filter(
+            mealId => existingMeals.get(mealId) === false
+        );
+
+        if (inactiveMealIds.length > 0) {
             return {
-                status: 400,
+                status: 409,
                 jsonBody: {
-                    error: 'One or more submitted meals do not exist',
-                    missingMealIds
+                    error: 'Archived meals cannot be added to a menu',
+                    inactiveMealIds
                 }
             };
         }
@@ -199,26 +206,36 @@ async function putMenuWeek(pool, weekNumber, request, context) {
         transactionStarted = true;
 
         const menuDaysResult = await new sql.Request(transaction)
+            .input('cycleId', sql.Int, cycleId)
             .input('weekNumber', sql.Int, weekNumber)
             .query(`
                 SELECT
                     md.MenuDayID,
-                    md.DayNumber
-                FROM dbo.MenuWeeks mw
+                    md.DayNumber,
+                    mc.Status
+                FROM dbo.MenuCycles mc
+                INNER JOIN dbo.MenuWeeks mw
+                    ON mw.MenuCycleID = mc.MenuCycleID
                 INNER JOIN dbo.MenuDays md
                     ON md.MenuWeekID = mw.MenuWeekID
-                WHERE mw.WeekNumber = @weekNumber
+                WHERE mc.MenuCycleID = @cycleId
+                  AND mw.WeekNumber = @weekNumber
                 ORDER BY md.DayNumber;
             `);
 
         if (menuDaysResult.recordset.length === 0) {
             await transaction.rollback();
             transactionStarted = false;
+            return notFound(`Menu cycle ${cycleId}, week ${weekNumber} does not exist`);
+        }
 
+        if (menuDaysResult.recordset[0].Status === 'Archived') {
+            await transaction.rollback();
+            transactionStarted = false;
             return {
-                status: 404,
+                status: 409,
                 jsonBody: {
-                    error: `Menu week ${weekNumber} does not exist`
+                    error: 'Archived menu cycles cannot be edited'
                 }
             };
         }
@@ -237,17 +254,17 @@ async function putMenuWeek(pool, weekNumber, request, context) {
         if (missingDays.length > 0) {
             await transaction.rollback();
             transactionStarted = false;
-
             return {
                 status: 409,
                 jsonBody: {
-                    error: `Menu week ${weekNumber} is missing weekdays in the database`,
+                    error: `Menu cycle ${cycleId}, week ${weekNumber} is missing weekdays in the database`,
                     missingDays
                 }
             };
         }
 
         await new sql.Request(transaction)
+            .input('cycleId', sql.Int, cycleId)
             .input('weekNumber', sql.Int, weekNumber)
             .query(`
                 DELETE dm
@@ -256,7 +273,8 @@ async function putMenuWeek(pool, weekNumber, request, context) {
                     ON md.MenuDayID = dm.MenuDayID
                 INNER JOIN dbo.MenuWeeks mw
                     ON mw.MenuWeekID = md.MenuWeekID
-                WHERE mw.WeekNumber = @weekNumber;
+                WHERE mw.MenuCycleID = @cycleId
+                  AND mw.WeekNumber = @weekNumber;
             `);
 
         let insertedMeals = 0;
@@ -292,6 +310,7 @@ async function putMenuWeek(pool, weekNumber, request, context) {
             status: 200,
             jsonBody: {
                 success: true,
+                menuCycleId: cycleId,
                 weekNumber,
                 insertedMeals
             }
@@ -361,4 +380,33 @@ function validatePayload(body) {
     }
 
     return null;
+}
+
+function formatDate(value) {
+    if (typeof value === 'string') return value.slice(0, 10);
+    return value.toISOString().slice(0, 10);
+}
+
+function badRequest(message) {
+    return {
+        status: 400,
+        jsonBody: { error: message }
+    };
+}
+
+function badRequestWithDetails(message, details) {
+    return {
+        status: 400,
+        jsonBody: {
+            error: message,
+            ...details
+        }
+    };
+}
+
+function notFound(message) {
+    return {
+        status: 404,
+        jsonBody: { error: message }
+    };
 }
