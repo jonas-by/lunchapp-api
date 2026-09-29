@@ -14,13 +14,10 @@ app.http('kitchen-orders', {
         if (!isIsoDate(dateFrom) || !isIsoDate(dateTo)) {
             return badRequest('dateFrom and dateTo are required and must use YYYY-MM-DD format');
         }
-
         if (dateFrom > dateTo) {
             return badRequest('dateFrom cannot be later than dateTo');
         }
-
-        const rangeDays = daysBetween(dateFrom, dateTo) + 1;
-        if (rangeDays > MAX_RANGE_DAYS) {
+        if (daysBetween(dateFrom, dateTo) + 1 > MAX_RANGE_DAYS) {
             return badRequest(`Date range cannot exceed ${MAX_RANGE_DAYS} days`);
         }
 
@@ -30,9 +27,28 @@ app.http('kitchen-orders', {
                 .input('dateFrom', sql.Date, dateFrom)
                 .input('dateTo', sql.Date, dateTo)
                 .query(`
+                    WITH EmployeeCancellations AS
+                    (
+                        SELECT
+                            OrderID,
+                            SUM(Quantity) AS CancelledQuantity
+                        FROM dbo.OrderCancellations
+                        WHERE OrderType = N'Employee'
+                        GROUP BY OrderID
+                    ),
+                    GuestCancellations AS
+                    (
+                        SELECT
+                            GuestOrderID,
+                            SUM(Quantity) AS CancelledQuantity
+                        FROM dbo.OrderCancellations
+                        WHERE OrderType = N'Guest'
+                        GROUP BY GuestOrderID
+                    )
                     SELECT
                         N'employee' AS OrderType,
                         o.OrderID,
+                        CAST(NULL AS INT) AS GuestOrderID,
                         o.MenuDate,
                         o.EmployeeNo,
                         e.FirstName,
@@ -42,7 +58,9 @@ app.http('kitchen-orders', {
                         m.NameSV,
                         m.NameFI,
                         m.Category,
-                        o.Quantity,
+                        o.Quantity AS OriginalQuantity,
+                        COALESCE(ec.CancelledQuantity, 0) AS CancelledQuantity,
+                        o.Quantity - COALESCE(ec.CancelledQuantity, 0) AS ActiveQuantity,
                         CAST(NULL AS NVARCHAR(255)) AS WorkTask,
                         o.OrderTime
                     FROM dbo.Orders o
@@ -50,14 +68,18 @@ app.http('kitchen-orders', {
                         ON e.EmployeeNo = o.EmployeeNo
                     INNER JOIN dbo.Meals m
                         ON m.MealID = o.OrderedMealID
+                    LEFT JOIN EmployeeCancellations ec
+                        ON ec.OrderID = o.OrderID
                     WHERE o.MenuDate >= @dateFrom
                       AND o.MenuDate <= @dateTo
+                      AND o.Quantity - COALESCE(ec.CancelledQuantity, 0) > 0
 
                     UNION ALL
 
                     SELECT
                         N'guest' AS OrderType,
-                        go.GuestOrderID AS OrderID,
+                        CAST(NULL AS INT) AS OrderID,
+                        go.GuestOrderID,
                         go.MenuDate,
                         go.HostEmployeeNo AS EmployeeNo,
                         e.FirstName,
@@ -67,7 +89,9 @@ app.http('kitchen-orders', {
                         m.NameSV,
                         m.NameFI,
                         m.Category,
-                        go.Quantity,
+                        go.Quantity AS OriginalQuantity,
+                        COALESCE(gc.CancelledQuantity, 0) AS CancelledQuantity,
+                        go.Quantity - COALESCE(gc.CancelledQuantity, 0) AS ActiveQuantity,
                         go.WorkTask,
                         go.OrderTime
                     FROM dbo.GuestOrders go
@@ -75,8 +99,11 @@ app.http('kitchen-orders', {
                         ON e.EmployeeNo = go.HostEmployeeNo
                     INNER JOIN dbo.Meals m
                         ON m.MealID = go.OrderedMealID
+                    LEFT JOIN GuestCancellations gc
+                        ON gc.GuestOrderID = go.GuestOrderID
                     WHERE go.MenuDate >= @dateFrom
                       AND go.MenuDate <= @dateTo
+                      AND go.Quantity - COALESCE(gc.CancelledQuantity, 0) > 0
 
                     ORDER BY
                         MenuDate,
@@ -90,11 +117,6 @@ app.http('kitchen-orders', {
             const employeeOrders = orders.filter(order => order.orderType === 'employee');
             const guestOrders = orders.filter(order => order.orderType === 'guest');
 
-            context.log(
-                `Kitchen report ${dateFrom} to ${dateTo}: ` +
-                `${orders.length} rows, ${sumQuantity(orders)} portions`
-            );
-
             return {
                 status: 200,
                 jsonBody: {
@@ -103,9 +125,13 @@ app.http('kitchen-orders', {
                     generatedAt: new Date().toISOString(),
                     summary: {
                         orderRows: orders.length,
-                        totalPortions: sumQuantity(orders),
-                        employeePortions: sumQuantity(employeeOrders),
-                        guestPortions: sumQuantity(guestOrders),
+                        totalPortions: sumActiveQuantity(orders),
+                        employeePortions: sumActiveQuantity(employeeOrders),
+                        guestPortions: sumActiveQuantity(guestOrders),
+                        cancelledPortions: orders.reduce(
+                            (total, order) => total + order.cancelledQuantity,
+                            0
+                        ),
                         uniqueEmployees: new Set(
                             employeeOrders.map(order => order.employeeNo)
                         ).size,
@@ -130,29 +156,36 @@ app.http('kitchen-orders', {
 });
 
 function mapOrder(row) {
-    const employeeName = [row.FirstName, row.LastName]
-        .filter(Boolean)
-        .join(' ') || `Employee ${row.EmployeeNo}`;
+    const originalQuantity = Number(row.OriginalQuantity);
+    const cancelledQuantity = Number(row.CancelledQuantity);
+    const activeQuantity = Number(row.ActiveQuantity);
 
     return {
         orderType: row.OrderType,
         orderId: row.OrderID,
+        guestOrderId: row.GuestOrderID,
         menuDate: formatSqlDate(row.MenuDate),
         employeeNo: row.EmployeeNo,
-        employeeName,
+        employeeName: [row.FirstName, row.LastName]
+            .filter(Boolean)
+            .join(' ') || `Employee ${row.EmployeeNo}`,
         mealId: row.MealID,
         nameEN: row.NameEN,
         nameSV: row.NameSV,
         nameFI: row.NameFI,
         category: row.Category,
-        quantity: Number(row.Quantity),
+        quantity: activeQuantity,
+        originalQuantity,
+        cancelledQuantity,
+        activeQuantity,
+        canCancel: activeQuantity > 0,
         workTask: row.WorkTask || null,
         orderTime: row.OrderTime
     };
 }
 
-function sumQuantity(orders) {
-    return orders.reduce((total, order) => total + order.quantity, 0);
+function sumActiveQuantity(orders) {
+    return orders.reduce((total, order) => total + order.activeQuantity, 0);
 }
 
 function formatSqlDate(value) {
@@ -164,7 +197,6 @@ function isIsoDate(value) {
     if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
         return false;
     }
-
     const date = new Date(`${value}T00:00:00Z`);
     return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
@@ -177,8 +209,5 @@ function daysBetween(fromDate, toDate) {
 }
 
 function badRequest(message) {
-    return {
-        status: 400,
-        jsonBody: { error: message }
-    };
+    return { status: 400, jsonBody: { error: message } };
 }
