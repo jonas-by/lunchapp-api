@@ -80,14 +80,7 @@ app.http('kitchen-orders', {
 
                     ORDER BY
                         MenuDate,
-                        CASE Category
-                            WHEN 'Main' THEN 1
-                            WHEN 'Vegetarian' THEN 2
-                            WHEN 'Soup' THEN 3
-                            WHEN 'Salad' THEN 4
-                            WHEN 'Dessert' THEN 5
-                            ELSE 6
-                        END,
+                        Category,
                         NameSV,
                         OrderType,
                         EmployeeNo;
