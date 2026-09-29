@@ -118,32 +118,30 @@ async function createEmployee(pool, request, context) {
         .input('employeeNo', sql.Int, employee.employeeNo)
         .input('cardNumber', sql.NVarChar(50), employee.cardNumber)
         .query(`
-            SELECT TOP (1)
+            SELECT
                 EmployeeNo,
-                FirstName,
-                LastName,
-                CardNumber,
-                CASE
-                    WHEN EmployeeNo = @employeeNo THEN 'employeeNo'
-                    ELSE 'cardNumber'
-                END AS DuplicateField
+                CardNumber
             FROM dbo.Employees
             WHERE EmployeeNo = @employeeNo
                OR (
                     @cardNumber IS NOT NULL
                     AND CardNumber = @cardNumber
-               )
-            ORDER BY CASE WHEN EmployeeNo = @employeeNo THEN 0 ELSE 1 END;
+               );
         `);
 
     if (duplicateResult.recordset.length > 0) {
         const duplicate = duplicateResult.recordset[0];
 
-        const field = duplicate.DuplicateField;
-        const value = field === 'employeeNo'
-            ? String(employee.employeeNo)
-            : employee.cardNumber;
-        return duplicateValueResponse(field, value, duplicate);
+        return {
+            status: 409,
+            jsonBody: {
+                error: duplicate.EmployeeNo === employee.employeeNo
+                    ? `Employee ${employee.employeeNo} already exists`
+                    : `Card number ${employee.cardNumber} is already assigned`,
+                employeeNo: duplicate.EmployeeNo,
+                cardNumber: duplicate.CardNumber
+            }
+        };
     }
 
     context.log(`Creating employee ${employee.employeeNo}`);
@@ -215,22 +213,20 @@ async function updateEmployee(pool, employeeNo, request, context) {
             .input('employeeNo', sql.Int, employeeNo)
             .input('cardNumber', sql.NVarChar(50), employee.cardNumber)
             .query(`
-                SELECT TOP (1)
-                    EmployeeNo,
-                    FirstName,
-                    LastName,
-                    CardNumber
+                SELECT EmployeeNo
                 FROM dbo.Employees
                 WHERE CardNumber = @cardNumber
                   AND EmployeeNo <> @employeeNo;
             `);
 
         if (cardResult.recordset.length > 0) {
-            return duplicateValueResponse(
-                'cardNumber',
-                employee.cardNumber,
-                cardResult.recordset[0]
-            );
+            return {
+                status: 409,
+                jsonBody: {
+                    error: `Card number ${employee.cardNumber} is already assigned`,
+                    employeeNo: cardResult.recordset[0].EmployeeNo
+                }
+            };
         }
     }
 
@@ -456,23 +452,6 @@ async function readJsonBody(request) {
     }
 }
 
-function duplicateValueResponse(field, value, employee) {
-    const employeeName = [employee.FirstName, employee.LastName]
-        .filter(Boolean)
-        .join(' ') || `employee ${employee.EmployeeNo}`;
-    const label = field === 'employeeNo' ? 'Employee number' : 'Card number';
-    return {
-        status: 409,
-        jsonBody: {
-            code: 'DUPLICATE_EMPLOYEE_VALUE',
-            field,
-            value,
-            employeeNo: employee.EmployeeNo,
-            employeeName,
-            error: `${label} ${value} is already assigned to ${employeeName}.`
-        }
-    };
-}
 function badRequest(message) {
     return {
         status: 400,
