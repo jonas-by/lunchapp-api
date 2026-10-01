@@ -7,30 +7,60 @@ app.http('kiosk-card-login', {
     route: 'kiosk/card-login',
     handler: async (request, context) => {
         let body;
-        try { body = await request.json(); }
-        catch { return response(400, { error: 'Request body must contain valid JSON.' }); }
+        try {
+            body = await request.json();
+        } catch {
+            return response(400, { error: 'Request body must contain valid JSON.' });
+        }
 
-        const cardNumber = text(body.cardNumber, 100);
-        if (!cardNumber) return response(400, { error: 'cardNumber is required.' });
+        const cardNumber = cleanCardNumber(body.cardNumber);
+        if (!cardNumber) {
+            return response(400, { error: 'cardNumber is required.' });
+        }
 
         try {
             const pool = await sql.connect(process.env.SqlConnectionString);
-            const result = await pool.request()
+
+            // Employee cards remain authoritative in dbo.Employees.
+            const employeeResult = await pool.request()
+                .input('CardNumber', sql.NVarChar(100), cardNumber)
+                .query(`
+                    SELECT TOP (1)
+                        EmployeeNo,
+                        FirstName,
+                        LastName,
+                        CardNumber
+                    FROM dbo.Employees
+                    WHERE CardNumber = @CardNumber;
+                `);
+
+            if (employeeResult.recordset.length) {
+                const employee = employeeResult.recordset[0];
+                const employeeName = [employee.FirstName, employee.LastName]
+                    .filter(Boolean)
+                    .join(' ');
+
+                return response(200, {
+                    ownerType: 'employee',
+                    employeeNo: employee.EmployeeNo,
+                    cardNumber: String(employee.CardNumber),
+                    displayName: employeeName || `Employee ${employee.EmployeeNo}`
+                });
+            }
+
+            // KioskCards is reserved for external and temporary cards.
+            const externalResult = await pool.request()
                 .input('CardNumber', sql.NVarChar(100), cardNumber)
                 .query(`
                     SELECT
                         c.CardID,
                         c.CardNumber,
-                        c.OwnerType,
-                        c.EmployeeNo,
                         c.ExternalAccountID,
                         c.DisplayNameOverride,
                         c.IsActive AS CardIsActive,
                         c.ValidFrom AS CardValidFrom,
                         c.ValidUntil AS CardValidUntil,
-                        e.FirstName,
-                        e.LastName,
-                        a.DisplayName AS ExternalDisplayName,
+                        a.DisplayName,
                         a.CompanyName,
                         a.AccountMode,
                         a.CreditLimitCents,
@@ -41,50 +71,47 @@ app.http('kiosk-card-login', {
                         COALESCE(b.AvailablePrepaidCents, 0) AS AvailablePrepaidCents,
                         COALESCE(b.OutstandingCents, 0) AS OutstandingCents
                     FROM dbo.KioskCards c
-                    LEFT JOIN dbo.Employees e
-                        ON c.OwnerType = N'Employee'
-                       AND e.EmployeeNo = c.EmployeeNo
-                    LEFT JOIN dbo.ExternalAccounts a
-                        ON c.OwnerType = N'External'
-                       AND a.ExternalAccountID = c.ExternalAccountID
+                    INNER JOIN dbo.ExternalAccounts a
+                        ON a.ExternalAccountID = c.ExternalAccountID
                     LEFT JOIN dbo.vwExternalAccountBalances b
                         ON b.ExternalAccountID = c.ExternalAccountID
-                    WHERE c.CardNumber = @CardNumber;
+                    WHERE c.CardNumber = @CardNumber
+                      AND c.OwnerType = N'External';
                 `);
 
-            if (!result.recordset.length) {
+            if (!externalResult.recordset.length) {
                 return response(404, { error: 'Card not found.' });
             }
 
-            const card = result.recordset[0];
+            const card = externalResult.recordset[0];
             const now = new Date();
+            const today = now.toISOString().slice(0, 10);
 
-            if (!card.CardIsActive) return response(403, { error: 'Card is inactive.' });
-            if (card.CardValidFrom && now < new Date(card.CardValidFrom)) return response(403, { error: 'Card is not valid yet.' });
-            if (card.CardValidUntil && now > new Date(card.CardValidUntil)) return response(403, { error: 'Card has expired.' });
-
-            if (card.OwnerType === 'Employee') {
-                const employeeName = [card.FirstName, card.LastName].filter(Boolean).join(' ');
-                return response(200, {
-                    cardId: card.CardID,
-                    cardNumber: card.CardNumber,
-                    ownerType: 'employee',
-                    employeeNo: card.EmployeeNo,
-                    displayName: card.DisplayNameOverride || employeeName || `Employee ${card.EmployeeNo}`
-                });
+            if (!card.CardIsActive) {
+                return response(403, { error: 'Card is inactive.' });
             }
-
-            if (!card.AccountIsActive) return response(403, { error: 'External account is inactive.' });
-            const today = new Date().toISOString().slice(0, 10);
-            if (card.AccountValidFrom && today < dateOnly(card.AccountValidFrom)) return response(403, { error: 'External account is not valid yet.' });
-            if (card.AccountValidUntil && today > dateOnly(card.AccountValidUntil)) return response(403, { error: 'External account has expired.' });
+            if (card.CardValidFrom && now < new Date(card.CardValidFrom)) {
+                return response(403, { error: 'Card is not valid yet.' });
+            }
+            if (card.CardValidUntil && now > new Date(card.CardValidUntil)) {
+                return response(403, { error: 'Card has expired.' });
+            }
+            if (!card.AccountIsActive) {
+                return response(403, { error: 'External account is inactive.' });
+            }
+            if (card.AccountValidFrom && today < dateOnly(card.AccountValidFrom)) {
+                return response(403, { error: 'External account is not valid yet.' });
+            }
+            if (card.AccountValidUntil && today > dateOnly(card.AccountValidUntil)) {
+                return response(403, { error: 'External account has expired.' });
+            }
 
             return response(200, {
                 cardId: card.CardID,
                 cardNumber: card.CardNumber,
                 ownerType: 'external',
                 externalAccountId: card.ExternalAccountID,
-                displayName: card.DisplayNameOverride || card.ExternalDisplayName,
+                displayName: card.DisplayNameOverride || card.DisplayName,
                 companyName: card.CompanyName,
                 accountMode: card.AccountMode,
                 creditLimitCents: card.CreditLimitCents,
@@ -94,11 +121,25 @@ app.http('kiosk-card-login', {
             });
         } catch (error) {
             context.error('Kiosk card login failed', error);
-            return response(500, { error: 'Kiosk card login failed.', details: error.message });
+            return response(500, {
+                error: 'Kiosk card login failed.',
+                details: error.message
+            });
         }
     }
 });
 
-function text(value, max) { return typeof value === 'string' || typeof value === 'number' ? String(value).trim().slice(0, max) : ''; }
-function dateOnly(value) { return typeof value === 'string' ? value.slice(0, 10) : value.toISOString().slice(0, 10); }
-function response(status, jsonBody) { return { status, jsonBody }; }
+function cleanCardNumber(value) {
+    if (value === undefined || value === null) return '';
+    return String(value).trim().slice(0, 100);
+}
+
+function dateOnly(value) {
+    return typeof value === 'string'
+        ? value.slice(0, 10)
+        : value.toISOString().slice(0, 10);
+}
+
+function response(status, jsonBody) {
+    return { status, jsonBody };
+}
