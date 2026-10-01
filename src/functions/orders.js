@@ -84,6 +84,7 @@ async function getOrders(pool, request, context) {
             o.EmployeeNo,
             o.MenuDate,
             o.OrderedMealID AS MealID,
+            o.SaladID,
             o.Quantity AS OriginalQuantity,
             COALESCE(oc.CancelledQuantity, 0) AS CancelledQuantity,
             o.Quantity - COALESCE(oc.CancelledQuantity, 0) AS Quantity,
@@ -91,7 +92,10 @@ async function getOrders(pool, request, context) {
             m.NameEN,
             m.NameSV,
             m.NameFI,
-            m.Category
+            m.Category,
+            s.NameEN AS SaladNameEN,
+            s.NameSV AS SaladNameSV,
+            s.NameFI AS SaladNameFI
         FROM dbo.Orders o
         INNER JOIN dbo.Meals m
             ON m.MealID = o.OrderedMealID
@@ -128,6 +132,13 @@ async function getOrders(pool, request, context) {
                 employeeNo: row.EmployeeNo,
                 menuDate: formatSqlDate(row.MenuDate),
                 mealId: row.MealID,
+                saladId: row.SaladID,
+                salad: row.SaladID ? {
+                    saladId: row.SaladID,
+                    nameEN: row.SaladNameEN,
+                    nameSV: row.SaladNameSV,
+                    nameFI: row.SaladNameFI
+                } : null,
                 quantity: row.Quantity,
                 originalQuantity: row.OriginalQuantity,
                 cancelledQuantity: Number(row.CancelledQuantity),
@@ -233,6 +244,8 @@ async function putOrders(pool, request, context) {
                     o.OrderID,
                     o.MenuDate,
                     o.OrderedMealID AS MealID,
+                    o.SaladID,
+            o.SaladID,
                     COALESCE(SUM(c.Quantity), 0) AS CancelledQuantity
                 FROM dbo.Orders o
                 LEFT JOIN dbo.OrderCancellations c
@@ -241,19 +254,20 @@ async function putOrders(pool, request, context) {
                 WHERE o.EmployeeNo = @employeeNo
                   AND o.MenuDate >= @dateFrom
                   AND o.MenuDate <= @dateTo
-                GROUP BY o.OrderID, o.MenuDate, o.OrderedMealID;
+                GROUP BY o.OrderID, o.MenuDate, o.OrderedMealID, o.SaladID;
             `);
 
         const desiredKeys = new Set(
-            payload.orders.map(order => `${order.menuDate}|${order.mealId}`)
+            payload.orders.map(order => `${order.menuDate}|${order.mealId}|${order.saladId || 0}`)
         );
 
         for (const existing of existingResult.recordset) {
             const menuDate = formatSqlDate(existing.MenuDate);
-            const key = `${menuDate}|${existing.MealID}`;
+            const key = `${menuDate}|${existing.MealID}|${existing.SaladID || 0}`;
             if (!desiredKeys.has(key) && Number(existing.CancelledQuantity) === 0) {
                 await new sql.Request(transaction)
                     .input('orderId', sql.Int, existing.OrderID)
+                    .input('saladId', sql.Int, order.saladId)
                     .query('DELETE FROM dbo.Orders WHERE OrderID = @orderId;');
             }
         }
@@ -261,17 +275,20 @@ async function putOrders(pool, request, context) {
         for (const order of payload.orders) {
             const existing = existingResult.recordset.find(row =>
                 formatSqlDate(row.MenuDate) === order.menuDate &&
-                Number(row.MealID) === order.mealId
+                Number(row.MealID) === order.mealId &&
+                Number(row.SaladID || 0) === Number(order.saladId || 0)
             );
 
             if (existing) {
                 await new sql.Request(transaction)
                     .input('orderId', sql.Int, existing.OrderID)
+                    .input('saladId', sql.Int, order.saladId)
                     .input('quantity', sql.Int,
                         order.quantity + Number(existing.CancelledQuantity))
                     .query(`
                         UPDATE dbo.Orders
                         SET Quantity = @quantity,
+                            SaladID = @saladId,
                             OrderTime = SYSUTCDATETIME()
                         WHERE OrderID = @orderId;
                     `);
@@ -280,12 +297,13 @@ async function putOrders(pool, request, context) {
                     .input('employeeNo', sql.Int, payload.employeeNo)
                     .input('menuDate', sql.Date, order.menuDate)
                     .input('mealId', sql.Int, order.mealId)
+                    .input('saladId', sql.Int, order.saladId)
                     .input('quantity', sql.Int, order.quantity)
                     .query(`
                         INSERT INTO dbo.Orders
-                            (EmployeeNo, MenuDate, OrderedMealID, Quantity)
+                            (EmployeeNo, MenuDate, OrderedMealID, SaladID, Quantity)
                         VALUES
-                            (@employeeNo, @menuDate, @mealId, @quantity);
+                            (@employeeNo, @menuDate, @mealId, @saladId, @quantity);
                     `);
             }
         }
@@ -360,6 +378,9 @@ function validatePutPayload(body) {
         const menuDate = parseIsoDate(order.menuDate);
         const mealId = parsePositiveInteger(order.mealId);
         const quantity = parsePositiveInteger(order.quantity);
+        const saladId = order.saladId == null || order.saladId === ''
+            ? null
+            : parsePositiveInteger(order.saladId);
 
         if (!menuDate) {
             return {
@@ -377,6 +398,9 @@ function validatePutPayload(body) {
             return { error: 'Every mealId must be a positive integer' };
         }
 
+        if (order.saladId != null && order.saladId !== '' && !saladId) {
+            return { error: 'Every saladId must be null or a positive integer' };
+        }
         if (!quantity || quantity > 50) {
             return {
                 error: 'Every quantity must be an integer between 1 and 50'
@@ -389,6 +413,7 @@ function validatePutPayload(body) {
         uniqueOrders.set(key, {
             menuDate,
             mealId,
+            saladId,
             quantity: (existing?.quantity || 0) + quantity
         });
     }

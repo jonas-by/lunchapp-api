@@ -84,6 +84,7 @@ async function getGuestOrders(pool, request, context) {
             go.HostEmployeeNo,
             go.MenuDate,
             go.OrderedMealID AS MealID,
+            go.SaladID,
             go.Quantity AS OriginalQuantity,
             COALESCE(oc.CancelledQuantity, 0) AS CancelledQuantity,
             go.Quantity - COALESCE(oc.CancelledQuantity, 0) AS Quantity,
@@ -92,7 +93,10 @@ async function getGuestOrders(pool, request, context) {
             m.NameEN,
             m.NameSV,
             m.NameFI,
-            m.Category
+            m.Category,
+            s.NameEN AS SaladNameEN,
+            s.NameSV AS SaladNameSV,
+            s.NameFI AS SaladNameFI
         FROM dbo.GuestOrders go
         INNER JOIN dbo.Meals m
             ON m.MealID = go.OrderedMealID
@@ -129,6 +133,13 @@ async function getGuestOrders(pool, request, context) {
                 hostEmployeeNo: row.HostEmployeeNo,
                 menuDate: formatSqlDate(row.MenuDate),
                 mealId: row.MealID,
+                saladId: row.SaladID,
+                salad: row.SaladID ? {
+                    saladId: row.SaladID,
+                    nameEN: row.SaladNameEN,
+                    nameSV: row.SaladNameSV,
+                    nameFI: row.SaladNameFI
+                } : null,
                 quantity: row.Quantity,
                 originalQuantity: row.OriginalQuantity,
                 cancelledQuantity: Number(row.CancelledQuantity),
@@ -235,6 +246,8 @@ async function putGuestOrders(pool, request, context) {
                     go.GuestOrderID,
                     go.MenuDate,
                     go.OrderedMealID AS MealID,
+                    go.SaladID,
+            go.SaladID,
                     COALESCE(SUM(c.Quantity), 0) AS CancelledQuantity
                 FROM dbo.GuestOrders go
                 LEFT JOIN dbo.OrderCancellations c
@@ -243,19 +256,20 @@ async function putGuestOrders(pool, request, context) {
                 WHERE go.HostEmployeeNo = @hostEmployeeNo
                   AND go.MenuDate >= @dateFrom
                   AND go.MenuDate <= @dateTo
-                GROUP BY go.GuestOrderID, go.MenuDate, go.OrderedMealID;
+                GROUP BY go.GuestOrderID, go.MenuDate, go.OrderedMealID, go.SaladID;
             `);
 
         const desiredKeys = new Set(
-            payload.orders.map(order => `${order.menuDate}|${order.mealId}`)
+            payload.orders.map(order => `${order.menuDate}|${order.mealId}|${order.saladId || 0}`)
         );
 
         for (const existing of existingResult.recordset) {
             const menuDate = formatSqlDate(existing.MenuDate);
-            const key = `${menuDate}|${existing.MealID}`;
+            const key = `${menuDate}|${existing.MealID}|${existing.SaladID || 0}`;
             if (!desiredKeys.has(key) && Number(existing.CancelledQuantity) === 0) {
                 await new sql.Request(transaction)
                     .input('guestOrderId', sql.Int, existing.GuestOrderID)
+                    .input('saladId', sql.Int, order.saladId)
                     .query('DELETE FROM dbo.GuestOrders WHERE GuestOrderID = @guestOrderId;');
             }
         }
@@ -263,18 +277,21 @@ async function putGuestOrders(pool, request, context) {
         for (const order of payload.orders) {
             const existing = existingResult.recordset.find(row =>
                 formatSqlDate(row.MenuDate) === order.menuDate &&
-                Number(row.MealID) === order.mealId
+                Number(row.MealID) === order.mealId &&
+                Number(row.SaladID || 0) === Number(order.saladId || 0)
             );
 
             if (existing) {
                 await new sql.Request(transaction)
                     .input('guestOrderId', sql.Int, existing.GuestOrderID)
+                    .input('saladId', sql.Int, order.saladId)
                     .input('quantity', sql.Int,
                         order.quantity + Number(existing.CancelledQuantity))
                     .input('workTask', sql.NVarChar(200), order.workTask)
                     .query(`
                         UPDATE dbo.GuestOrders
                         SET Quantity = @quantity,
+                            SaladID = @saladId,
                             WorkTask = @workTask,
                             OrderTime = SYSUTCDATETIME()
                         WHERE GuestOrderID = @guestOrderId;
@@ -284,13 +301,14 @@ async function putGuestOrders(pool, request, context) {
                     .input('hostEmployeeNo', sql.Int, payload.hostEmployeeNo)
                     .input('menuDate', sql.Date, order.menuDate)
                     .input('mealId', sql.Int, order.mealId)
+                    .input('saladId', sql.Int, order.saladId)
                     .input('quantity', sql.Int, order.quantity)
                     .input('workTask', sql.NVarChar(200), order.workTask)
                     .query(`
                         INSERT INTO dbo.GuestOrders
-                            (HostEmployeeNo, MenuDate, OrderedMealID, Quantity, WorkTask)
+                            (HostEmployeeNo, MenuDate, OrderedMealID, SaladID, Quantity, WorkTask)
                         VALUES
-                            (@hostEmployeeNo, @menuDate, @mealId, @quantity, @workTask);
+                            (@hostEmployeeNo, @menuDate, @mealId, @saladId, @quantity, @workTask);
                     `);
             }
         }
@@ -365,6 +383,9 @@ function validatePutPayload(body) {
         const menuDate = parseIsoDate(order.menuDate);
         const mealId = parsePositiveInteger(order.mealId);
         const quantity = parsePositiveInteger(order.quantity);
+        const saladId = order.saladId == null || order.saladId === ''
+            ? null
+            : parsePositiveInteger(order.saladId);
         const workTask = typeof order.workTask === 'string'
             ? order.workTask.trim()
             : '';
@@ -385,6 +406,9 @@ function validatePutPayload(body) {
             return { error: 'Every mealId must be a positive integer' };
         }
 
+        if (order.saladId != null && order.saladId !== '' && !saladId) {
+            return { error: 'Every saladId must be null or a positive integer' };
+        }
         if (!quantity || quantity > 100) {
             return {
                 error: 'Every quantity must be an integer between 1 and 100'
@@ -407,6 +431,7 @@ function validatePutPayload(body) {
         uniqueOrders.set(key, {
             menuDate,
             mealId,
+            saladId,
             quantity: (existing?.quantity || 0) + quantity,
             workTask
         });
