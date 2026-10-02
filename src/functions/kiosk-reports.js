@@ -65,8 +65,8 @@ async function getOverview(pool, period, groupBy) {
         CROSS APPLY
         (
             SELECT
-                CONVERT(DATETIME2, CAST(@FromDate AS DATE) AT TIME ZONE '${REPORT_TIME_ZONE}' AT TIME ZONE 'UTC') AS FromUtc,
-                CONVERT(DATETIME2, DATEADD(DAY, 1, CAST(@ToDate AS DATE)) AT TIME ZONE '${REPORT_TIME_ZONE}' AT TIME ZONE 'UTC') AS ToUtc
+                CONVERT(DATETIME2, CAST(CAST(@FromDate AS DATE) AS DATETIME2) AT TIME ZONE '${REPORT_TIME_ZONE}' AT TIME ZONE 'UTC') AS FromUtc,
+                CONVERT(DATETIME2, CAST(DATEADD(DAY, 1, CAST(@ToDate AS DATE)) AS DATETIME2) AT TIME ZONE '${REPORT_TIME_ZONE}' AT TIME ZONE 'UTC') AS ToUtc
         ) AS boundaries
         WHERE s.SaleTime >= boundaries.FromUtc
           AND s.SaleTime < boundaries.ToUtc
