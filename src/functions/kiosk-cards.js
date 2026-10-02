@@ -49,7 +49,7 @@ async function getCards(pool, request, id) {
                 c.CardID,
                 c.CardNumber,
                 c.ExternalAccountID,
-                c.DisplayNameOverride,
+                c.CardHolderName,
                 c.IsActive,
                 c.ValidFrom,
                 c.ValidUntil,
@@ -104,7 +104,7 @@ async function createCard(pool, request) {
             OwnerType,
             EmployeeNo,
             ExternalAccountID,
-            DisplayNameOverride,
+            CardHolderName,
             IsActive,
             ValidFrom,
             ValidUntil
@@ -116,7 +116,7 @@ async function createCard(pool, request) {
             N'External',
             NULL,
             @ExternalAccountID,
-            @DisplayNameOverride,
+            @CardHolderName,
             @IsActive,
             @ValidFrom,
             @ValidUntil
@@ -151,7 +151,7 @@ async function updateCard(pool, request, id) {
             OwnerType = N'External',
             EmployeeNo = NULL,
             ExternalAccountID = @ExternalAccountID,
-            DisplayNameOverride = @DisplayNameOverride,
+            CardHolderName = @CardHolderName,
             IsActive = @IsActive,
             ValidFrom = @ValidFrom,
             ValidUntil = @ValidUntil,
@@ -246,7 +246,7 @@ function validateCard(body) {
     return {
         cardNumber,
         externalAccountId,
-        displayNameOverride: nullableText(body.displayNameOverride, 150),
+        cardHolderName: nullableText(body.cardHolderName, 200),
         isActive: parseBoolean(body.isActive, true),
         validFrom,
         validUntil
@@ -257,7 +257,7 @@ function cardRequest(request, value) {
     return request
         .input('CardNumber', sql.NVarChar(100), value.cardNumber)
         .input('ExternalAccountID', sql.Int, value.externalAccountId)
-        .input('DisplayNameOverride', sql.NVarChar(150), value.displayNameOverride)
+        .input('CardHolderName', sql.NVarChar(200), value.cardHolderName)
         .input('IsActive', sql.Bit, value.isActive)
         .input('ValidFrom', sql.DateTime2, value.validFrom)
         .input('ValidUntil', sql.DateTime2, value.validUntil);
@@ -269,8 +269,8 @@ function mapCard(row) {
         cardNumber: row.CardNumber,
         ownerType: 'external',
         externalAccountId: row.ExternalAccountID,
-        displayNameOverride: row.DisplayNameOverride,
-        displayName: row.DisplayNameOverride || row.DisplayName,
+        cardHolderName: row.CardHolderName,
+        displayName: row.DisplayName,
         companyName: row.CompanyName,
         accountMode: row.AccountMode,
         accountIsActive: Boolean(row.AccountIsActive),
@@ -289,7 +289,7 @@ function mapInsertedCard(row) {
         cardNumber: row.CardNumber,
         ownerType: 'external',
         externalAccountId: row.ExternalAccountID,
-        displayNameOverride: row.DisplayNameOverride,
+        cardHolderName: row.CardHolderName,
         isActive: Boolean(row.IsActive),
         validFrom: row.ValidFrom,
         validUntil: row.ValidUntil,
