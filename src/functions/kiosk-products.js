@@ -8,22 +8,37 @@ app.http('kiosk-products', {
     handler: async (request, context) => {
         try {
             const pool = await sql.connect(process.env.SqlConnectionString);
-            const id = parseId(request.params.id);
+            const rawId = request.params.id;
+            const id = parseId(rawId);
 
-            if (request.params.id && !id) {
+            if (rawId && !id) {
                 return response(400, { error: 'Invalid product ID.' });
             }
 
             switch (request.method.toUpperCase()) {
-                case 'GET': return await getProducts(pool, request, id);
-                case 'POST': return await createProduct(pool, request);
+                case 'GET':
+                    return await getProducts(pool, request, id);
+
+                case 'POST':
+                    if (id) {
+                        return response(400, { error: 'Do not include a product ID when creating a product.' });
+                    }
+                    return await createProduct(pool, request);
+
                 case 'PUT':
-                    if (!id) return response(400, { error: 'Product ID is required.' });
+                    if (!id) {
+                        return response(400, { error: 'Product ID is required.' });
+                    }
                     return await updateProduct(pool, request, id);
+
                 case 'DELETE':
-                    if (!id) return response(400, { error: 'Product ID is required.' });
+                    if (!id) {
+                        return response(400, { error: 'Product ID is required.' });
+                    }
                     return await deactivateProduct(pool, id);
-                default: return response(405, { error: 'Method not allowed.' });
+
+                default:
+                    return response(405, { error: 'Method not allowed.' });
             }
         } catch (error) {
             context.error('Kiosk products request failed', error);
@@ -37,25 +52,50 @@ async function getProducts(pool, request, id) {
         const result = await pool.request()
             .input('ProductID', sql.Int, id)
             .query(`
-                SELECT ProductID, NameEn, NameSv, NameFi, PriceCents,
-                       ImageUrl, Icon, IsActive, SortOrder, CreatedAt, UpdatedAt
+                SELECT
+                    ProductID,
+                    NameEN,
+                    NameSV,
+                    NameFI,
+                    Price,
+                    Icon,
+                    ImageUrl,
+                    Active,
+                    CreatedAt,
+                    UpdatedAt
                 FROM dbo.KioskProducts
                 WHERE ProductID = @ProductID;
             `);
 
-        if (!result.recordset.length) return response(404, { error: 'Product not found.' });
+        if (!result.recordset.length) {
+            return response(404, { error: 'Product not found.' });
+        }
+
         return response(200, mapProduct(result.recordset[0]));
     }
 
-    const includeInactive = parseBoolean(request.query.get('includeInactive'), false);
+    const includeInactive = parseBoolean(
+        request.query.get('includeInactive'),
+        false
+    );
+
     const result = await pool.request()
         .input('IncludeInactive', sql.Bit, includeInactive)
         .query(`
-            SELECT ProductID, NameEn, NameSv, NameFi, PriceCents,
-                   ImageUrl, Icon, IsActive, SortOrder, CreatedAt, UpdatedAt
+            SELECT
+                ProductID,
+                NameEN,
+                NameSV,
+                NameFI,
+                Price,
+                Icon,
+                ImageUrl,
+                Active,
+                CreatedAt,
+                UpdatedAt
             FROM dbo.KioskProducts
-            WHERE @IncludeInactive = 1 OR IsActive = 1
-            ORDER BY SortOrder, NameEn, ProductID;
+            WHERE @IncludeInactive = 1 OR Active = 1
+            ORDER BY NameEN, ProductID;
         `);
 
     return response(200, result.recordset.map(mapProduct));
@@ -63,16 +103,45 @@ async function getProducts(pool, request, id) {
 
 async function createProduct(pool, request) {
     const body = await readJson(request);
-    const value = validateProduct(body);
-    if (value.error) return response(400, { error: value.error });
+    const validation = validateProduct(body);
 
-    const result = await productRequest(pool.request(), value)
+    if (validation.error) {
+        return response(400, { error: validation.error });
+    }
+
+    const result = await productRequest(pool.request(), validation.value)
         .query(`
-            INSERT dbo.KioskProducts
-                (NameEn, NameSv, NameFi, PriceCents, ImageUrl, Icon, IsActive, SortOrder)
-            OUTPUT inserted.*
+            INSERT INTO dbo.KioskProducts
+            (
+                NameEN,
+                NameSV,
+                NameFI,
+                Price,
+                Icon,
+                ImageUrl,
+                Active
+            )
+            OUTPUT
+                inserted.ProductID,
+                inserted.NameEN,
+                inserted.NameSV,
+                inserted.NameFI,
+                inserted.Price,
+                inserted.Icon,
+                inserted.ImageUrl,
+                inserted.Active,
+                inserted.CreatedAt,
+                inserted.UpdatedAt
             VALUES
-                (@NameEn, @NameSv, @NameFi, @PriceCents, @ImageUrl, @Icon, @IsActive, @SortOrder);
+            (
+                @NameEN,
+                @NameSV,
+                @NameFI,
+                @Price,
+                @Icon,
+                @ImageUrl,
+                @Active
+            );
         `);
 
     return response(201, mapProduct(result.recordset[0]));
@@ -80,27 +149,44 @@ async function createProduct(pool, request) {
 
 async function updateProduct(pool, request, id) {
     const body = await readJson(request);
-    const value = validateProduct(body);
-    if (value.error) return response(400, { error: value.error });
+    const validation = validateProduct(body);
+
+    if (validation.error) {
+        return response(400, { error: validation.error });
+    }
 
     const result = await productRequest(
-        pool.request().input('ProductID', sql.Int, id), value
+        pool.request().input('ProductID', sql.Int, id),
+        validation.value
     ).query(`
         UPDATE dbo.KioskProducts
-        SET NameEn = @NameEn,
-            NameSv = @NameSv,
-            NameFi = @NameFi,
-            PriceCents = @PriceCents,
-            ImageUrl = @ImageUrl,
+        SET
+            NameEN = @NameEN,
+            NameSV = @NameSV,
+            NameFI = @NameFI,
+            Price = @Price,
             Icon = @Icon,
-            IsActive = @IsActive,
-            SortOrder = @SortOrder,
+            ImageUrl = @ImageUrl,
+            Active = @Active,
             UpdatedAt = SYSUTCDATETIME()
-        OUTPUT inserted.*
+        OUTPUT
+            inserted.ProductID,
+            inserted.NameEN,
+            inserted.NameSV,
+            inserted.NameFI,
+            inserted.Price,
+            inserted.Icon,
+            inserted.ImageUrl,
+            inserted.Active,
+            inserted.CreatedAt,
+            inserted.UpdatedAt
         WHERE ProductID = @ProductID;
     `);
 
-    if (!result.recordset.length) return response(404, { error: 'Product not found.' });
+    if (!result.recordset.length) {
+        return response(404, { error: 'Product not found.' });
+    }
+
     return response(200, mapProduct(result.recordset[0]));
 }
 
@@ -109,70 +195,174 @@ async function deactivateProduct(pool, id) {
         .input('ProductID', sql.Int, id)
         .query(`
             UPDATE dbo.KioskProducts
-            SET IsActive = 0, UpdatedAt = SYSUTCDATETIME()
-            OUTPUT inserted.*
+            SET
+                Active = 0,
+                UpdatedAt = SYSUTCDATETIME()
+            OUTPUT
+                inserted.ProductID,
+                inserted.NameEN,
+                inserted.NameSV,
+                inserted.NameFI,
+                inserted.Price,
+                inserted.Icon,
+                inserted.ImageUrl,
+                inserted.Active,
+                inserted.CreatedAt,
+                inserted.UpdatedAt
             WHERE ProductID = @ProductID;
         `);
 
-    if (!result.recordset.length) return response(404, { error: 'Product not found.' });
+    if (!result.recordset.length) {
+        return response(404, { error: 'Product not found.' });
+    }
+
     return response(200, mapProduct(result.recordset[0]));
 }
 
 function validateProduct(body) {
-    const nameEn = text(body.nameEn, 100);
-    const nameSv = text(body.nameSv, 100);
-    const nameFi = text(body.nameFi, 100);
-    const priceCents = integer(body.priceCents);
-    const sortOrder = integer(body.sortOrder ?? 0);
+    const nameEn = text(body.nameEn, 255);
+    const nameSv = nullableText(body.nameSv, 255);
+    const nameFi = nullableText(body.nameFi, 255);
+    const price = parsePrice(body.price);
 
-    if (!nameEn || !nameSv || !nameFi) return { error: 'nameEn, nameSv and nameFi are required.' };
-    if (priceCents === null || priceCents < 0) return { error: 'priceCents must be a non-negative integer.' };
-    if (sortOrder === null || sortOrder < 0) return { error: 'sortOrder must be a non-negative integer.' };
+    if (!nameEn) {
+        return { error: 'nameEn is required.' };
+    }
+
+    if (price === null) {
+        return {
+            error: 'price is required and must be a non-negative number with no more than two decimal places.'
+        };
+    }
 
     return {
-        nameEn, nameSv, nameFi, priceCents, sortOrder,
-        imageUrl: nullableText(body.imageUrl, 500),
-        icon: nullableText(body.icon, 20),
-        isActive: parseBoolean(body.isActive, true)
+        value: {
+            nameEn,
+            nameSv,
+            nameFi,
+            price,
+            icon: nullableText(body.icon, 100),
+            imageUrl: nullableText(body.imageUrl, 500),
+            active: parseBoolean(
+                body.active !== undefined ? body.active : body.isActive,
+                true
+            )
+        }
     };
 }
 
 function productRequest(request, value) {
     return request
-        .input('NameEn', sql.NVarChar(100), value.nameEn)
-        .input('NameSv', sql.NVarChar(100), value.nameSv)
-        .input('NameFi', sql.NVarChar(100), value.nameFi)
-        .input('PriceCents', sql.Int, value.priceCents)
+        .input('NameEN', sql.NVarChar(255), value.nameEn)
+        .input('NameSV', sql.NVarChar(255), value.nameSv)
+        .input('NameFI', sql.NVarChar(255), value.nameFi)
+        .input('Price', sql.Decimal(10, 2), value.price)
+        .input('Icon', sql.NVarChar(100), value.icon)
         .input('ImageUrl', sql.NVarChar(500), value.imageUrl)
-        .input('Icon', sql.NVarChar(20), value.icon)
-        .input('IsActive', sql.Bit, value.isActive)
-        .input('SortOrder', sql.Int, value.sortOrder);
+        .input('Active', sql.Bit, value.active);
 }
 
 function mapProduct(row) {
     return {
         productId: row.ProductID,
-        nameEn: row.NameEn,
-        nameSv: row.NameSv,
-        nameFi: row.NameFi,
-        priceCents: row.PriceCents,
-        imageUrl: row.ImageUrl,
+        nameEn: row.NameEN,
+        nameSv: row.NameSV,
+        nameFi: row.NameFI,
+        price: Number(row.Price),
         icon: row.Icon,
-        isActive: Boolean(row.IsActive),
-        sortOrder: row.SortOrder,
+        imageUrl: row.ImageUrl,
+        active: Boolean(row.Active),
+        isActive: Boolean(row.Active),
         createdAt: row.CreatedAt,
         updatedAt: row.UpdatedAt
     };
 }
 
-async function readJson(request) { try { return await request.json(); } catch { return {}; } }
-function parseId(value) { const n = Number(value); return Number.isInteger(n) && n > 0 ? n : null; }
-function integer(value) { const n = Number(value); return Number.isInteger(n) ? n : null; }
-function text(value, max) { return typeof value === 'string' ? value.trim().slice(0, max) : ''; }
-function nullableText(value, max) { const v = text(value, max); return v || null; }
-function parseBoolean(value, fallback) { if (value === undefined || value === null || value === '') return fallback; return value === true || value === 1 || String(value).toLowerCase() === 'true' || String(value) === '1'; }
-function response(status, jsonBody) { return { status, jsonBody }; }
+async function readJson(request) {
+    try {
+        return await request.json();
+    } catch {
+        return {};
+    }
+}
+
+function parseId(value) {
+    const number = Number(value);
+    return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function parsePrice(value) {
+    if (value === undefined || value === null || value === '') {
+        return null;
+    }
+
+    const number = Number(value);
+
+    if (!Number.isFinite(number) || number < 0) {
+        return null;
+    }
+
+    const rounded = Math.round((number + Number.EPSILON) * 100) / 100;
+
+    if (Math.abs(number - rounded) > 0.0000001 || rounded > 99999999.99) {
+        return null;
+    }
+
+    return rounded;
+}
+
+function text(value, maxLength) {
+    return typeof value === 'string'
+        ? value.trim().slice(0, maxLength)
+        : '';
+}
+
+function nullableText(value, maxLength) {
+    const parsed = text(value, maxLength);
+    return parsed || null;
+}
+
+function parseBoolean(value, fallback) {
+    if (value === undefined || value === null || value === '') {
+        return fallback;
+    }
+
+    if (typeof value === 'boolean') {
+        return value;
+    }
+
+    if (value === 1 || String(value).toLowerCase() === 'true' || String(value) === '1') {
+        return true;
+    }
+
+    if (value === 0 || String(value).toLowerCase() === 'false' || String(value) === '0') {
+        return false;
+    }
+
+    return fallback;
+}
+
+function response(status, jsonBody) {
+    return { status, jsonBody };
+}
+
 function databaseError(error, message) {
-    if (error.number === 2601 || error.number === 2627) return response(409, { error: 'A conflicting record already exists.', details: error.message });
-    return response(500, { error: message, details: error.message });
+    if (error.number === 2601 || error.number === 2627) {
+        return response(409, {
+            error: 'A conflicting record already exists.',
+            details: error.message
+        });
+    }
+
+    if (error.number === 547) {
+        return response(409, {
+            error: 'The requested change conflicts with existing data or a database constraint.',
+            details: error.message
+        });
+    }
+
+    return response(500, {
+        error: message,
+        details: error.message
+    });
 }
