@@ -41,7 +41,7 @@ app.http('kitchen-orders', {
                         CAST(NULL AS int) AS GuestSaladOrderID,
                         o.MenuDate,
                         o.EmployeeNo,
-                        e.FirstName,
+                        COALESCE(e.FirstName, kc.CardHolderName, a.DisplayName, N'External account') AS FirstName,
                         e.LastName,
                         o.OrderedMealID AS ItemID,
                         m.NameEN,
@@ -54,6 +54,15 @@ app.http('kitchen-orders', {
                     FROM dbo.Orders o
                     INNER JOIN dbo.Meals m ON m.MealID = o.OrderedMealID
                     LEFT JOIN dbo.Employees e ON e.EmployeeNo = o.EmployeeNo
+                    LEFT JOIN dbo.ExternalAccounts a ON a.ExternalAccountID = o.ExternalAccountID
+                    OUTER APPLY
+                    (
+                        SELECT TOP (1) c.CardHolderName
+                        FROM dbo.KioskCards c
+                        WHERE c.ExternalAccountID = o.ExternalAccountID
+                          AND NULLIF(LTRIM(RTRIM(c.CardHolderName)), N'') IS NOT NULL
+                        ORDER BY c.IsActive DESC, c.KioskCardID
+                    ) kc
                     LEFT JOIN EmployeeMealCancellations c ON c.OrderID = o.OrderID
                     WHERE o.MenuDate BETWEEN @dateFrom AND @dateTo
                       AND o.Quantity - COALESCE(c.Cancelled, 0) > 0
@@ -84,7 +93,8 @@ app.http('kitchen-orders', {
                         CAST(NULL AS int), CAST(NULL AS int),
                         so.SaladOrderID, CAST(NULL AS int),
                         so.MenuDate, so.EmployeeNo,
-                        e.FirstName, e.LastName,
+                        COALESCE(e.FirstName, kc.CardHolderName, a.DisplayName, N'External account') AS FirstName,
+                        e.LastName,
                         so.SaladID,
                         s.NameEn, s.NameSv, s.NameFi, N'Salad',
                         so.Quantity - COALESCE(c.Cancelled, 0),
@@ -92,6 +102,15 @@ app.http('kitchen-orders', {
                     FROM dbo.SaladOrders so
                     INNER JOIN dbo.Salads s ON s.SaladID = so.SaladID
                     LEFT JOIN dbo.Employees e ON e.EmployeeNo = so.EmployeeNo
+                    LEFT JOIN dbo.ExternalAccounts a ON a.ExternalAccountID = so.ExternalAccountID
+                    OUTER APPLY
+                    (
+                        SELECT TOP (1) c.CardHolderName
+                        FROM dbo.KioskCards c
+                        WHERE c.ExternalAccountID = so.ExternalAccountID
+                          AND NULLIF(LTRIM(RTRIM(c.CardHolderName)), N'') IS NOT NULL
+                        ORDER BY c.IsActive DESC, c.KioskCardID
+                    ) kc
                     OUTER APPLY
                     (
                         SELECT SUM(sc.Quantity) AS Cancelled
@@ -163,7 +182,7 @@ function mapOrder(row) {
         guestSaladOrderId: row.GuestSaladOrderID,
         menuDate: formatDate(row.MenuDate),
         employeeNo: row.EmployeeNo,
-        employeeName: [row.FirstName, row.LastName].filter(Boolean).join(' ') || `Employee ${row.EmployeeNo}`,
+        employeeName: [row.FirstName, row.LastName].filter(Boolean).join(' ') || (row.EmployeeNo ? `Employee ${row.EmployeeNo}` : 'External account'),
         mealId: row.ItemType === 'salad' ? `S${row.ItemID}` : row.ItemID,
         saladId: row.ItemType === 'salad' ? row.ItemID : null,
         nameEN: row.NameEN,
