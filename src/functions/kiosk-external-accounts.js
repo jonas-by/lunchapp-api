@@ -77,21 +77,52 @@ app.http('kiosk-external-account-ledger', {
                 .input('DateTo', sql.Date, dateTo)
                 .input('Limit', sql.Int, limit)
                 .query(`
+                    WITH CombinedLedger AS
+                    (
+                        SELECT
+                            LedgerEntryID,
+                            ExternalAccountID,
+                            EntryTime,
+                            EntryType,
+                            AmountCents,
+                            SaleID,
+                            SettlementReference,
+                            InvoiceNumber,
+                            Description,
+                            CreatedBy,
+                            ReversesLedgerEntryID
+                        FROM dbo.ExternalAccountLedger
+                        WHERE ExternalAccountID = @ExternalAccountID
+
+                        UNION ALL
+
+                        SELECT
+                            CASE WHEN SourceType = N'MealOrder'
+                                 THEN -CAST(SourceID AS bigint)
+                                 ELSE -CAST(1000000000000 + SourceID AS bigint)
+                            END AS LedgerEntryID,
+                            ExternalAccountID,
+                            CAST(MenuDate AS datetime2(0)) AS EntryTime,
+                            N'LunchPurchase' AS EntryType,
+                            -ChargeCents AS AmountCents,
+                            CAST(NULL AS bigint) AS SaleID,
+                            CAST(NULL AS nvarchar(100)) AS SettlementReference,
+                            CAST(NULL AS nvarchar(100)) AS InvoiceNumber,
+                            CONCAT(N'Lunch: ', ActiveQuantity, N' x ',
+                                   CONVERT(decimal(10,2), PriceCents / 100.0), N' EUR',
+                                   CASE WHEN NULLIF(ItemName, N'') IS NULL THEN N''
+                                        ELSE CONCAT(N' - ', ItemName) END) AS Description,
+                            N'LunchApp' AS CreatedBy,
+                            CAST(NULL AS bigint) AS ReversesLedgerEntryID
+                        FROM dbo.vwExternalLunchChargeEntries
+                        WHERE ExternalAccountID = @ExternalAccountID
+                    )
                     SELECT TOP (@Limit)
-                        LedgerEntryID,
-                        ExternalAccountID,
-                        EntryTime,
-                        EntryType,
-                        AmountCents,
-                        SaleID,
-                        SettlementReference,
-                        InvoiceNumber,
-                        Description,
-                        CreatedBy,
-                        ReversesLedgerEntryID
-                    FROM dbo.ExternalAccountLedger
-                    WHERE ExternalAccountID = @ExternalAccountID
-                      AND (@DateFrom IS NULL OR EntryTime >= @DateFrom)
+                        LedgerEntryID, ExternalAccountID, EntryTime, EntryType,
+                        AmountCents, SaleID, SettlementReference, InvoiceNumber,
+                        Description, CreatedBy, ReversesLedgerEntryID
+                    FROM CombinedLedger
+                    WHERE (@DateFrom IS NULL OR EntryTime >= @DateFrom)
                       AND (@DateTo IS NULL OR EntryTime < DATEADD(day, 1, @DateTo))
                     ORDER BY EntryTime DESC, LedgerEntryID DESC;
                 `);
