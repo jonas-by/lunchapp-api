@@ -70,11 +70,11 @@ async function externalReport(pool, from, to) {
     SaladCancel AS (SELECT SaladOrderID,SUM(Quantity) Qty FROM dbo.SaladOrderCancellations WHERE OrderType=N'Employee' GROUP BY SaladOrderID),
     Salads AS (SELECT o.ExternalAccountID,SUM(CASE WHEN o.Quantity-COALESCE(c.Qty,0)>0 THEN o.Quantity-COALESCE(c.Qty,0) ELSE 0 END) SaladLunches FROM dbo.SaladOrders o LEFT JOIN SaladCancel c ON c.SaladOrderID=o.SaladOrderID WHERE o.ExternalAccountID IS NOT NULL AND o.MenuDate BETWEEN @from AND @to GROUP BY o.ExternalAccountID),
     Owners AS (SELECT ExternalAccountID FROM Meals UNION SELECT ExternalAccountID FROM Salads)
-    SELECT a.ExternalAccountID,a.DisplayName,a.CompanyName,COALESCE(m.MealLunches,0) MealLunches,COALESCE(s.SaladLunches,0) SaladLunches,COALESCE(m.MealLunches,0)+COALESCE(s.SaladLunches,0) NumberOfLunches
+    SELECT a.ExternalAccountID,a.DisplayName,a.CompanyName,a.ExternalReference,a.InvoiceReference,COALESCE(m.MealLunches,0) MealLunches,COALESCE(s.SaladLunches,0) SaladLunches,COALESCE(m.MealLunches,0)+COALESCE(s.SaladLunches,0) NumberOfLunches
     FROM Owners x INNER JOIN dbo.ExternalAccounts a ON a.ExternalAccountID=x.ExternalAccountID
     LEFT JOIN Meals m ON m.ExternalAccountID=x.ExternalAccountID LEFT JOIN Salads s ON s.ExternalAccountID=x.ExternalAccountID
     WHERE COALESCE(m.MealLunches,0)+COALESCE(s.SaladLunches,0)>0 ORDER BY a.CompanyName,a.DisplayName,a.ExternalAccountID`);
-  return result.recordset.map(x=>({externalAccountId:x.ExternalAccountID,displayName:x.DisplayName||'',companyName:x.CompanyName||'',mealLunches:Number(x.MealLunches),saladLunches:Number(x.SaladLunches),numberOfLunches:Number(x.NumberOfLunches)}));
+  return result.recordset.map(x=>({externalAccountId:x.ExternalAccountID,displayName:x.DisplayName||'',companyName:x.CompanyName||'',externalReference:x.ExternalReference||'',invoiceReference:x.InvoiceReference||'',mealLunches:Number(x.MealLunches),saladLunches:Number(x.SaladLunches),numberOfLunches:Number(x.NumberOfLunches)}));
 }
 
 async function guestReport(pool, from, to) {
