@@ -61,7 +61,7 @@ app.http('kitchen-orders', {
                         FROM dbo.KioskCards c
                         WHERE c.ExternalAccountID = o.ExternalAccountID
                           AND NULLIF(LTRIM(RTRIM(c.CardHolderName)), N'') IS NOT NULL
-                        ORDER BY c.IsActive DESC, c.KioskCardID
+                        ORDER BY c.IsActive DESC, c.CardID
                     ) kc
                     LEFT JOIN EmployeeMealCancellations c ON c.OrderID = o.OrderID
                     WHERE o.MenuDate BETWEEN @dateFrom AND @dateTo
@@ -109,7 +109,7 @@ app.http('kitchen-orders', {
                         FROM dbo.KioskCards c
                         WHERE c.ExternalAccountID = so.ExternalAccountID
                           AND NULLIF(LTRIM(RTRIM(c.CardHolderName)), N'') IS NOT NULL
-                        ORDER BY c.IsActive DESC, c.KioskCardID
+                        ORDER BY c.IsActive DESC, c.CardID
                     ) kc
                     OUTER APPLY
                     (
