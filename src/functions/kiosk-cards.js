@@ -59,7 +59,9 @@ async function getCards(pool, request, id) {
                 a.CompanyName,
                 a.AccountMode,
                 a.IsActive AS AccountIsActive,
-                COALESCE(b.BalanceCents, 0) AS BalanceCents
+                COALESCE(b.BalanceCents, 0) AS BalanceCents,
+                COALESCE(b.AvailablePrepaidCents, 0) AS AvailablePrepaidCents,
+                COALESCE(b.OutstandingCents, 0) AS OutstandingCents
             FROM dbo.KioskCards c
             INNER JOIN dbo.ExternalAccounts a
                 ON a.ExternalAccountID = c.ExternalAccountID
@@ -275,6 +277,8 @@ function mapCard(row) {
         accountMode: row.AccountMode,
         accountIsActive: Boolean(row.AccountIsActive),
         balanceCents: Number(row.BalanceCents || 0),
+        availablePrepaidCents: Number(row.AvailablePrepaidCents || 0),
+        outstandingCents: Number(row.OutstandingCents || 0),
         isActive: Boolean(row.IsActive),
         validFrom: row.ValidFrom,
         validUntil: row.ValidUntil,
