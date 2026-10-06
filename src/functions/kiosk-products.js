@@ -35,7 +35,7 @@ app.http('kiosk-products', {
                     if (!id) {
                         return response(400, { error: 'Product ID is required.' });
                     }
-                    return await deactivateProduct(pool, id);
+                    return await deactivateProduct(pool, request, id);
 
                 default:
                     return response(405, { error: 'Method not allowed.' });
@@ -49,29 +49,13 @@ app.http('kiosk-products', {
 
 async function getProducts(pool, request, id) {
     if (id) {
-        const result = await pool.request()
-            .input('ProductID', sql.Int, id)
-            .query(`
-                SELECT
-                    ProductID,
-                    NameEN,
-                    NameSV,
-                    NameFI,
-                    Price,
-                    Icon,
-                    ImageUrl,
-                    Active,
-                    CreatedAt,
-                    UpdatedAt
-                FROM dbo.KioskProducts
-                WHERE ProductID = @ProductID;
-            `);
+        const product = await selectProductById(pool, id);
 
-        if (!result.recordset.length) {
+        if (!product) {
             return response(404, { error: 'Product not found.' });
         }
 
-        return response(200, mapProduct(result.recordset[0]));
+        return response(200, mapProduct(product, request));
     }
 
     const includeInactive = parseBoolean(
@@ -81,24 +65,12 @@ async function getProducts(pool, request, id) {
 
     const result = await pool.request()
         .input('IncludeInactive', sql.Bit, includeInactive)
-        .query(`
-            SELECT
-                ProductID,
-                NameEN,
-                NameSV,
-                NameFI,
-                Price,
-                Icon,
-                ImageUrl,
-                Active,
-                CreatedAt,
-                UpdatedAt
-            FROM dbo.KioskProducts
-            WHERE @IncludeInactive = 1 OR Active = 1
-            ORDER BY NameEN, ProductID;
+        .query(`${productSelect()}
+            WHERE @IncludeInactive = 1 OR kp.Active = 1
+            ORDER BY kp.NameEN, kp.ProductID;
         `);
 
-    return response(200, result.recordset.map(mapProduct));
+    return response(200, result.recordset.map(row => mapProduct(row, request)));
 }
 
 async function createProduct(pool, request) {
@@ -119,19 +91,10 @@ async function createProduct(pool, request) {
                 Price,
                 Icon,
                 ImageUrl,
+                ImageAssetID,
                 Active
             )
-            OUTPUT
-                inserted.ProductID,
-                inserted.NameEN,
-                inserted.NameSV,
-                inserted.NameFI,
-                inserted.Price,
-                inserted.Icon,
-                inserted.ImageUrl,
-                inserted.Active,
-                inserted.CreatedAt,
-                inserted.UpdatedAt
+            OUTPUT inserted.ProductID
             VALUES
             (
                 @NameEN,
@@ -140,11 +103,13 @@ async function createProduct(pool, request) {
                 @Price,
                 @Icon,
                 @ImageUrl,
+                @ImageAssetID,
                 @Active
             );
         `);
 
-    return response(201, mapProduct(result.recordset[0]));
+    const product = await selectProductById(pool, result.recordset[0].ProductID);
+    return response(201, mapProduct(product, request));
 }
 
 async function updateProduct(pool, request, id) {
@@ -167,19 +132,10 @@ async function updateProduct(pool, request, id) {
             Price = @Price,
             Icon = @Icon,
             ImageUrl = @ImageUrl,
+            ImageAssetID = @ImageAssetID,
             Active = @Active,
             UpdatedAt = SYSUTCDATETIME()
-        OUTPUT
-            inserted.ProductID,
-            inserted.NameEN,
-            inserted.NameSV,
-            inserted.NameFI,
-            inserted.Price,
-            inserted.Icon,
-            inserted.ImageUrl,
-            inserted.Active,
-            inserted.CreatedAt,
-            inserted.UpdatedAt
+        OUTPUT inserted.ProductID
         WHERE ProductID = @ProductID;
     `);
 
@@ -187,10 +143,11 @@ async function updateProduct(pool, request, id) {
         return response(404, { error: 'Product not found.' });
     }
 
-    return response(200, mapProduct(result.recordset[0]));
+    const product = await selectProductById(pool, id);
+    return response(200, mapProduct(product, request));
 }
 
-async function deactivateProduct(pool, id) {
+async function deactivateProduct(pool, request, id) {
     const result = await pool.request()
         .input('ProductID', sql.Int, id)
         .query(`
@@ -198,17 +155,7 @@ async function deactivateProduct(pool, id) {
             SET
                 Active = 0,
                 UpdatedAt = SYSUTCDATETIME()
-            OUTPUT
-                inserted.ProductID,
-                inserted.NameEN,
-                inserted.NameSV,
-                inserted.NameFI,
-                inserted.Price,
-                inserted.Icon,
-                inserted.ImageUrl,
-                inserted.Active,
-                inserted.CreatedAt,
-                inserted.UpdatedAt
+            OUTPUT inserted.ProductID
             WHERE ProductID = @ProductID;
         `);
 
@@ -216,7 +163,42 @@ async function deactivateProduct(pool, id) {
         return response(404, { error: 'Product not found.' });
     }
 
-    return response(200, mapProduct(result.recordset[0]));
+    const product = await selectProductById(pool, id);
+    return response(200, mapProduct(product, request));
+}
+
+async function selectProductById(pool, id) {
+    const result = await pool.request()
+        .input('ProductID', sql.Int, id)
+        .query(`${productSelect()}
+            WHERE kp.ProductID = @ProductID;
+        `);
+
+    return result.recordset[0] || null;
+}
+
+function productSelect() {
+    return `
+        SELECT
+            kp.ProductID,
+            kp.NameEN,
+            kp.NameSV,
+            kp.NameFI,
+            kp.Price,
+            kp.Icon,
+            kp.ImageUrl,
+            kp.ImageAssetID,
+            kp.Active,
+            kp.CreatedAt,
+            kp.UpdatedAt,
+            ia.DisplayName AS ImageDisplayName,
+            ia.OriginalFileName AS ImageOriginalFileName,
+            ia.ContentType AS ImageContentType,
+            ia.FileSize AS ImageFileSize
+        FROM dbo.KioskProducts kp
+        LEFT JOIN dbo.ImageAssets ia
+            ON ia.ImageAssetID = kp.ImageAssetID
+    `;
 }
 
 function validateProduct(body) {
@@ -224,6 +206,7 @@ function validateProduct(body) {
     const nameSv = nullableText(body.nameSv, 255);
     const nameFi = nullableText(body.nameFi, 255);
     const price = parsePrice(body.price);
+    const imageAssetId = parseNullableId(body.imageAssetId);
 
     if (!nameEn) {
         return { error: 'nameEn is required.' };
@@ -235,6 +218,10 @@ function validateProduct(body) {
         };
     }
 
+    if (imageAssetId.invalid) {
+        return { error: 'imageAssetId must be a positive integer or null.' };
+    }
+
     return {
         value: {
             nameEn,
@@ -243,6 +230,7 @@ function validateProduct(body) {
             price,
             icon: nullableText(body.icon, 100),
             imageUrl: nullableText(body.imageUrl, 500),
+            imageAssetId: imageAssetId.value,
             active: parseBoolean(
                 body.active !== undefined ? body.active : body.isActive,
                 true
@@ -259,10 +247,18 @@ function productRequest(request, value) {
         .input('Price', sql.Decimal(10, 2), value.price)
         .input('Icon', sql.NVarChar(100), value.icon)
         .input('ImageUrl', sql.NVarChar(500), value.imageUrl)
+        .input('ImageAssetID', sql.Int, value.imageAssetId)
         .input('Active', sql.Bit, value.active);
 }
 
-function mapProduct(row) {
+function mapProduct(row, request) {
+    const imageAssetId = row.ImageAssetID === null || row.ImageAssetID === undefined
+        ? null
+        : Number(row.ImageAssetID);
+    const managedImageUrl = imageAssetId
+        ? absoluteApiUrl(request, `/api/images/${imageAssetId}/content`)
+        : null;
+
     return {
         productId: row.ProductID,
         nameEn: row.NameEN,
@@ -270,12 +266,25 @@ function mapProduct(row) {
         nameFi: row.NameFI,
         price: Number(row.Price),
         icon: row.Icon,
-        imageUrl: row.ImageUrl,
+        imageAssetId,
+        imageDisplayName: row.ImageDisplayName || null,
+        imageOriginalFileName: row.ImageOriginalFileName || null,
+        imageContentType: row.ImageContentType || null,
+        imageFileSize: row.ImageFileSize === null || row.ImageFileSize === undefined
+            ? null
+            : Number(row.ImageFileSize),
+        imageUrl: managedImageUrl || row.ImageUrl,
+        legacyImageUrl: row.ImageUrl,
         active: Boolean(row.Active),
         isActive: Boolean(row.Active),
         createdAt: row.CreatedAt,
         updatedAt: row.UpdatedAt
     };
+}
+
+function absoluteApiUrl(request, relativePath) {
+    const url = new URL(request.url);
+    return `${url.protocol}//${url.host}${relativePath}`;
 }
 
 async function readJson(request) {
@@ -289,6 +298,19 @@ async function readJson(request) {
 function parseId(value) {
     const number = Number(value);
     return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function parseNullableId(value) {
+    if (value === undefined || value === null || value === '') {
+        return { value: null, invalid: false };
+    }
+
+    const number = Number(value);
+    if (!Number.isInteger(number) || number <= 0) {
+        return { value: null, invalid: true };
+    }
+
+    return { value: number, invalid: false };
 }
 
 function parsePrice(value) {
