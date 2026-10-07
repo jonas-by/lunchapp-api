@@ -1,8 +1,112 @@
 const { app } = require('@azure/functions');
 const sql = require('mssql');
-app.http('salad-orders',{methods:['GET','PUT'],authLevel:'anonymous',route:'salad-orders',handler:async(request,context)=>{try{const pool=await sql.connect(process.env.SqlConnectionString);return request.method==='GET'?get(pool,request):put(pool,request)}catch(error){context.error('salad-orders failed',error);return{status:500,jsonBody:{error:'salad-orders failed',details:error.message}}}}});
-const pos=v=>{const n=Number(v);return Number.isInteger(n)&&n>0?n:null},date=v=>typeof v==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(v)?v:null,fmt=v=>typeof v==='string'?v.slice(0,10):v.toISOString().slice(0,10),bad=(error,extra={})=>({status:400,jsonBody:{error,...extra}});
-function owner(s){const employeeNo=pos(s.employeeNo),externalAccountId=pos(s.externalAccountId??s.externalAccountID);if((employeeNo?1:0)+(externalAccountId?1:0)!==1)return{error:'Supply exactly one of employeeNo or externalAccountId'};return employeeNo?{type:'employee',employeeNo,column:'EmployeeNo',value:employeeNo}:{type:'external',externalAccountId,column:'ExternalAccountID',value:externalAccountId}}
-async function valid(pool,o){const table=o.type==='employee'?'Employees':'ExternalAccounts',col=o.type==='employee'?'EmployeeNo':'ExternalAccountID',active=o.type==='employee'?'COALESCE(Active,1)=1':`IsActive=1 AND (ValidFrom IS NULL OR ValidFrom<=CAST(GETDATE() AS date)) AND (ValidUntil IS NULL OR ValidUntil>=CAST(GETDATE() AS date))`;return(await pool.request().input('id',sql.Int,o.value).query(`SELECT 1 ok FROM dbo.${table} WHERE ${col}=@id AND ${active}`)).recordset.length>0}
-async function get(pool,request){const u=new URL(request.url),o=owner(Object.fromEntries(u.searchParams));if(o.error)return bad(o.error);const from=date(u.searchParams.get('dateFrom'))||'1900-01-01',to=date(u.searchParams.get('dateTo'))||'9999-12-31';const r=await pool.request().input('id',sql.Int,o.value).input('from',sql.Date,from).input('to',sql.Date,to).query(`SELECT so.SaladOrderID,so.EmployeeNo,so.ExternalAccountID,so.MenuDate,so.SaladID,so.Quantity,so.OrderTime,s.NameEn,s.NameSv,s.NameFi FROM dbo.SaladOrders so INNER JOIN dbo.Salads s ON s.SaladID=so.SaladID WHERE so.${o.column}=@id AND so.MenuDate BETWEEN @from AND @to ORDER BY so.MenuDate,s.SortOrder,s.SaladID`);return{status:200,jsonBody:{ownerType:o.type,employeeNo:o.employeeNo||null,externalAccountId:o.externalAccountId||null,saladOrders:r.recordset.map(x=>({saladOrderId:x.SaladOrderID,employeeNo:x.EmployeeNo,externalAccountId:x.ExternalAccountID,menuDate:fmt(x.MenuDate),saladId:x.SaladID,quantity:x.Quantity,orderTime:x.OrderTime,nameEn:x.NameEn,nameSv:x.NameSv,nameFi:x.NameFi}))}}}
-async function put(pool,request){let b;try{b=await request.json()}catch{return bad('Request body must be JSON')}const o=owner(b);if(o.error)return bad(o.error);const from=date(b.dateFrom),to=date(b.dateTo);if(!from||!to||from>to||!Array.isArray(b.saladOrders))return bad('Invalid date range or saladOrders');if(!await valid(pool,o))return bad('Owner does not exist, is inactive, or is outside its validity period');const map=new Map();for(const x of b.saladOrders){const d=date(x.menuDate),id=pos(x.saladId),q=pos(x.quantity);if(!d||d<from||d>to||!id||!q||q>50)return bad('Invalid salad order');const k=d+':'+id,old=map.get(k);map.set(k,{menuDate:d,saladId:id,quantity:(old?.quantity||0)+q})}const lines=[...map.values()];const tx=new sql.Transaction(pool);await tx.begin();try{await new sql.Request(tx).input('id',sql.Int,o.value).input('from',sql.Date,from).input('to',sql.Date,to).query(`DELETE dbo.SaladOrders WHERE ${o.column}=@id AND MenuDate BETWEEN @from AND @to`);for(const x of lines)await new sql.Request(tx).input('employeeNo',sql.Int,o.employeeNo||null).input('externalAccountId',sql.Int,o.externalAccountId||null).input('d',sql.Date,x.menuDate).input('s',sql.Int,x.saladId).input('q',sql.Int,x.quantity).query('INSERT dbo.SaladOrders(EmployeeNo,ExternalAccountID,MenuDate,SaladID,Quantity) VALUES(@employeeNo,@externalAccountId,@d,@s,@q)');await tx.commit();return{status:200,jsonBody:{success:true,ownerType:o.type,saladOrderLines:lines.length,totalSalads:lines.reduce((a,x)=>a+x.quantity,0)}}}catch(e){await tx.rollback();throw e}}
+
+app.http('salad-orders', {
+  methods: ['GET', 'PUT'], authLevel: 'anonymous', route: 'salad-orders',
+  handler: async (request, context) => {
+    try {
+      const pool = await sql.connect(process.env.SqlConnectionString);
+      return request.method === 'GET' ? get(pool, request) : put(pool, request);
+    } catch (error) {
+      context.error('salad-orders failed', error);
+      return { status: 500, jsonBody: { error: 'salad-orders failed', details: error.message } };
+    }
+  }
+});
+
+const pos = v => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
+const date = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
+const fmt = v => typeof v === 'string' ? v.slice(0, 10) : v.toISOString().slice(0, 10);
+const bad = (error, extra = {}) => ({ status: 400, jsonBody: { error, ...extra } });
+
+function owner(s) {
+  const employeeNo = pos(s.employeeNo);
+  const externalAccountId = pos(s.externalAccountId ?? s.externalAccountID);
+  const cardId = pos(s.cardId ?? s.cardID);
+  if ((employeeNo ? 1 : 0) + (externalAccountId ? 1 : 0) !== 1) return { error: 'Supply exactly one of employeeNo or externalAccountId' };
+  if (employeeNo && cardId) return { error: 'cardId is only valid for external accounts' };
+  return employeeNo
+    ? { type: 'employee', employeeNo, cardId: null, column: 'EmployeeNo', value: employeeNo }
+    : { type: 'external', externalAccountId, cardId, column: 'ExternalAccountID', value: externalAccountId };
+}
+
+async function valid(pool, o) {
+  const table = o.type === 'employee' ? 'Employees' : 'ExternalAccounts';
+  const col = o.type === 'employee' ? 'EmployeeNo' : 'ExternalAccountID';
+  const active = o.type === 'employee'
+    ? 'COALESCE(Active,1)=1'
+    : `IsActive=1 AND (ValidFrom IS NULL OR ValidFrom<=CAST(GETDATE() AS date)) AND (ValidUntil IS NULL OR ValidUntil>=CAST(GETDATE() AS date))`;
+  return (await pool.request().input('id', sql.Int, o.value).query(`SELECT 1 ok FROM dbo.${table} WHERE ${col}=@id AND ${active}`)).recordset.length > 0;
+}
+
+async function validCard(pool, o) {
+  if (o.type !== 'external') return true;
+  if (!o.cardId) return false;
+  return (await pool.request()
+    .input('cardId', sql.Int, o.cardId)
+    .input('externalAccountId', sql.Int, o.externalAccountId)
+    .query(`
+      SELECT 1 ok
+      FROM dbo.KioskCards
+      WHERE CardID=@cardId
+        AND ExternalAccountID=@externalAccountId
+        AND OwnerType=N'External'
+        AND IsActive=1
+        AND (ValidFrom IS NULL OR ValidFrom<=CAST(GETDATE() AS date))
+        AND (ValidUntil IS NULL OR ValidUntil>=CAST(GETDATE() AS date))
+    `)).recordset.length > 0;
+}
+
+async function get(pool, request) {
+  const u = new URL(request.url), o = owner(Object.fromEntries(u.searchParams));
+  if (o.error) return bad(o.error);
+  const from = date(u.searchParams.get('dateFrom')) || '1900-01-01';
+  const to = date(u.searchParams.get('dateTo')) || '9999-12-31';
+  const r = await pool.request().input('id', sql.Int, o.value).input('from', sql.Date, from).input('to', sql.Date, to).query(`
+    SELECT so.SaladOrderID,so.EmployeeNo,so.ExternalAccountID,so.CardID,so.MenuDate,so.SaladID,so.Quantity,so.OrderTime,
+           s.NameEn,s.NameSv,s.NameFi
+    FROM dbo.SaladOrders so
+    INNER JOIN dbo.Salads s ON s.SaladID=so.SaladID
+    WHERE so.${o.column}=@id AND so.MenuDate BETWEEN @from AND @to
+    ORDER BY so.MenuDate,s.SortOrder,s.SaladID
+  `);
+  return { status: 200, jsonBody: { ownerType: o.type, employeeNo: o.employeeNo || null, externalAccountId: o.externalAccountId || null, saladOrders: r.recordset.map(x => ({ saladOrderId: x.SaladOrderID, employeeNo: x.EmployeeNo, externalAccountId: x.ExternalAccountID, cardId: x.CardID, menuDate: fmt(x.MenuDate), saladId: x.SaladID, quantity: x.Quantity, orderTime: x.OrderTime, nameEn: x.NameEn, nameSv: x.NameSv, nameFi: x.NameFi })) } };
+}
+
+async function put(pool, request) {
+  let b;
+  try { b = await request.json(); } catch { return bad('Request body must be JSON'); }
+  const o = owner(b);
+  if (o.error) return bad(o.error);
+  const from = date(b.dateFrom), to = date(b.dateTo);
+  if (!from || !to || from > to || !Array.isArray(b.saladOrders)) return bad('Invalid date range or saladOrders');
+  if (!await valid(pool, o)) return bad('Owner does not exist, is inactive, or is outside its validity period');
+  if (o.type === 'external' && !o.cardId) return bad('cardId is required for external account salad orders');
+  if (!await validCard(pool, o)) return bad('Card does not exist, is inactive, is outside its validity period, or does not belong to the external account');
+
+  const map = new Map();
+  for (const x of b.saladOrders) {
+    const d = date(x.menuDate), id = pos(x.saladId), q = pos(x.quantity);
+    if (!d || d < from || d > to || !id || !q || q > 50) return bad('Invalid salad order');
+    const k = d + ':' + id, old = map.get(k);
+    map.set(k, { menuDate: d, saladId: id, quantity: (old?.quantity || 0) + q });
+  }
+  const lines = [...map.values()];
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
+  try {
+    await new sql.Request(tx).input('id', sql.Int, o.value).input('from', sql.Date, from).input('to', sql.Date, to)
+      .query(`DELETE dbo.SaladOrders WHERE ${o.column}=@id AND MenuDate BETWEEN @from AND @to`);
+    for (const x of lines) {
+      await new sql.Request(tx)
+        .input('employeeNo', sql.Int, o.employeeNo || null).input('externalAccountId', sql.Int, o.externalAccountId || null)
+        .input('cardId', sql.Int, o.cardId || null).input('d', sql.Date, x.menuDate).input('s', sql.Int, x.saladId).input('q', sql.Int, x.quantity)
+        .query('INSERT dbo.SaladOrders(EmployeeNo,ExternalAccountID,CardID,MenuDate,SaladID,Quantity) VALUES(@employeeNo,@externalAccountId,@cardId,@d,@s,@q)');
+    }
+    await tx.commit();
+    return { status: 200, jsonBody: { success: true, ownerType: o.type, externalAccountId: o.externalAccountId || null, cardId: o.cardId || null, saladOrderLines: lines.length, totalSalads: lines.reduce((a, x) => a + x.quantity, 0) } };
+  } catch (e) {
+    await tx.rollback();
+    throw e;
+  }
+}
