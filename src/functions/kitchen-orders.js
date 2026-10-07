@@ -41,6 +41,7 @@ app.http('kitchen-orders', {
                         CAST(NULL AS int) AS GuestSaladOrderID,
                         o.MenuDate,
                         o.EmployeeNo,
+                        CASE WHEN kc.CardNumber IS NULL THEN NULL ELSE RIGHT(CONVERT(nvarchar(100), kc.CardNumber), 5) END AS CardNumberLast5,
                         COALESCE(e.FirstName, kc.CardHolderName, a.DisplayName, N'External account') AS FirstName,
                         e.LastName,
                         o.OrderedMealID AS ItemID,
