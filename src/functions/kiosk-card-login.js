@@ -118,7 +118,11 @@ app.http('kiosk-card-login', {
                 creditLimitCents: card.CreditLimitCents,
                 balanceCents: Number(card.BalanceCents),
                 availableBalanceCents: Number(card.AvailablePrepaidCents),
-                outstandingCents: Number(card.OutstandingCents)
+                outstandingCents: Number(card.OutstandingCents),
+                availableCreditCents: Math.max(
+                    Number(card.CreditLimitCents || 0) - Number(card.OutstandingCents || 0),
+                    0
+                )
             });
         } catch (error) {
             context.error('Kiosk card login failed', error);
